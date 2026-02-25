@@ -8,6 +8,7 @@ import html
 import os
 import re
 import shutil
+import socket
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +113,13 @@ def default_output_path(parsed: ParsedReport) -> Path:
     safe_hostname = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in hostname)
     date_str = datetime.now().strftime("%Y-%m-%d")
     return Path("results") / f"report_{safe_hostname}_{date_str}.html"
+
+
+def default_report_path() -> Path:
+    hostname = socket.gethostname().split(".", 1)[0] or "unknown-host"
+    safe_hostname = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in hostname)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return Path("reports") / f"report_{safe_hostname}_{date_str}.dat"
 
 
 def default_system_data_path(report_path: Path) -> Path:
@@ -1293,7 +1301,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate a professional HTML report from a Lynis report.dat file."
     )
-    parser.add_argument("--report", required=True, help="Path to the input Lynis report.dat file.")
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="Path to the Lynis report.dat file. Default: reports/report_<hostname>_<YYYY-MM-DD>.dat",
+    )
     parser.add_argument(
         "--output",
         default=None,
@@ -1322,7 +1334,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--full-run",
         action="store_true",
-        help="Install tools, run scans, collect data, and then generate the HTML report.",
+        default=True,
+        help="Install tools, run scans, collect data, and then generate the HTML report (default behavior).",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Skip scans and generate HTML from existing data files only.",
     )
     return parser
 
@@ -1331,7 +1349,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    report_path = Path(args.report)
+    report_path = Path(args.report) if args.report else default_report_path()
     inferred_system_path = default_system_data_path(report_path)
     system_data_path = Path(args.system_data) if args.system_data else inferred_system_path
     inferred_log_path = default_log_path(report_path)
@@ -1339,7 +1357,9 @@ def main() -> int:
     inferred_openscap_path = default_openscap_data_path(report_path)
     openscap_data_path = Path(args.openscap_data) if args.openscap_data else inferred_openscap_path
 
-    if args.full_run:
+    run_full = args.full_run and not args.report_only
+
+    if run_full:
         run_full_collection(
             report_path=report_path,
             log_path=log_path,
