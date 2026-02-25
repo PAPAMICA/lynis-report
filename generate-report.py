@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import os
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
+from xml.etree import ElementTree as ET
 
 
 class ParsedReport:
@@ -125,6 +129,245 @@ def default_log_path(report_path: Path) -> Path:
             return report_path.parent.parent / "results" / log_name
         return report_path.with_name(log_name)
     return report_path.with_suffix(".log")
+
+
+def default_openscap_data_path(report_path: Path) -> Path:
+    filename = report_path.name
+    if filename.startswith("report_") and filename.endswith(".dat"):
+        return report_path.with_name("openscap_" + filename[len("report_"):])
+    return report_path.with_name("openscap_snapshot.dat")
+
+
+def detect_package_manager() -> str:
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("yum"):
+        return "yum"
+    if shutil.which("zypper"):
+        return "zypper"
+    if shutil.which("pacman"):
+        return "pacman"
+    if shutil.which("apk"):
+        return "apk"
+    return "unknown"
+
+
+def run_cmd(command: List[str], use_sudo: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    final_cmd = command[:]
+    if use_sudo and os.geteuid() != 0:
+        final_cmd = ["sudo"] + final_cmd
+    return subprocess.run(final_cmd, check=check, text=True, capture_output=True)
+
+
+def install_package(package_name: str) -> None:
+    manager = detect_package_manager()
+    if manager == "apt":
+        run_cmd(["apt-get", "update"], use_sudo=True)
+        run_cmd(["apt-get", "install", "-y", package_name], use_sudo=True)
+    elif manager == "dnf":
+        run_cmd(["dnf", "install", "-y", package_name], use_sudo=True)
+    elif manager == "yum":
+        run_cmd(["yum", "install", "-y", package_name], use_sudo=True)
+    elif manager == "zypper":
+        run_cmd(["zypper", "--non-interactive", "install", package_name], use_sudo=True)
+    elif manager == "pacman":
+        run_cmd(["pacman", "-Sy", "--noconfirm", package_name], use_sudo=True)
+    elif manager == "apk":
+        run_cmd(["apk", "add", "--no-cache", package_name], use_sudo=True)
+    else:
+        raise RuntimeError("Unsupported Linux distribution: package manager not found.")
+
+
+def ensure_lynis_installed() -> None:
+    if shutil.which("lynis"):
+        return
+    install_package("lynis")
+    if not shutil.which("lynis"):
+        raise RuntimeError("Lynis installation failed.")
+
+
+def ensure_openscap_installed() -> None:
+    if shutil.which("oscap"):
+        return
+    manager = detect_package_manager()
+    candidates = {
+        "apt": ["openscap-scanner", "ssg-debderived"],
+        "dnf": ["openscap-scanner", "scap-security-guide"],
+        "yum": ["openscap-scanner", "scap-security-guide"],
+        "zypper": ["openscap-utils", "scap-security-guide"],
+        "pacman": ["openscap"],
+        "apk": ["openscap-scanner"],
+    }
+    for pkg in candidates.get(manager, ["openscap-scanner"]):
+        try:
+            install_package(pkg)
+        except Exception:
+            continue
+        if shutil.which("oscap"):
+            return
+    if not shutil.which("oscap"):
+        raise RuntimeError("OpenSCAP installation failed.")
+
+
+def find_openscap_datastream() -> Path | None:
+    candidates = [
+        "/usr/share/xml/scap/ssg/content/ssg-debian-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-ubuntu-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-centos8-ds.xml",
+    ]
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def parse_openscap_results(results_xml: Path) -> Dict[str, str]:
+    summary = {
+        "openscap_total_rules": "0",
+        "openscap_passed_rules": "0",
+        "openscap_failed_rules": "0",
+        "openscap_error_rules": "0",
+        "openscap_notchecked_rules": "0",
+    }
+    if not results_xml.exists():
+        return summary
+
+    try:
+        tree = ET.parse(results_xml)
+    except ET.ParseError:
+        return summary
+    root = tree.getroot()
+    counts = {"pass": 0, "fail": 0, "error": 0, "notchecked": 0, "notselected": 0, "informational": 0}
+    for elem in root.iter():
+        tag = elem.tag.split("}", 1)[-1]
+        if tag != "rule-result":
+            continue
+        result_node = None
+        for child in elem:
+            child_tag = child.tag.split("}", 1)[-1]
+            if child_tag == "result":
+                result_node = child
+                break
+        if result_node is None or not result_node.text:
+            continue
+        key = result_node.text.strip().lower()
+        if key in counts:
+            counts[key] += 1
+
+    total = sum(counts.values())
+    summary["openscap_total_rules"] = str(total)
+    summary["openscap_passed_rules"] = str(counts["pass"])
+    summary["openscap_failed_rules"] = str(counts["fail"])
+    summary["openscap_error_rules"] = str(counts["error"])
+    summary["openscap_notchecked_rules"] = str(counts["notchecked"] + counts["notselected"])
+    return summary
+
+
+def run_full_collection(report_path: Path, log_path: Path, system_data_path: Path, openscap_data_path: Path) -> None:
+    ensure_lynis_installed()
+    ensure_openscap_installed()
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    system_data_path.parent.mkdir(parents=True, exist_ok=True)
+    openscap_data_path.parent.mkdir(parents=True, exist_ok=True)
+
+    run_cmd(
+        [
+            "lynis",
+            "audit",
+            "system",
+            "--report-file",
+            str(report_path),
+            "--logfile",
+            str(log_path),
+        ],
+        use_sudo=True,
+    )
+
+    # Reuse existing Bash collector for full machine context only.
+    collector_script = Path(__file__).with_name("get-data.sh")
+    run_cmd(["bash", str(collector_script), "--snapshot-only"], use_sudo=False, check=False)
+    default_snapshot = default_system_data_path(report_path)
+    if default_snapshot.exists() and default_snapshot != system_data_path:
+        system_data_path.write_text(default_snapshot.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+
+    datastream = find_openscap_datastream()
+    openscap_html = openscap_data_path.with_suffix(".html")
+    openscap_xml = openscap_data_path.with_suffix(".xml")
+
+    openscap_meta = {
+        "openscap_status": "not_run",
+        "openscap_profile": "N/A",
+        "openscap_datastream": "N/A",
+    }
+
+    if datastream is not None:
+        profile = "xccdf_org.ssgproject.content_profile_standard"
+        try:
+            run_cmd(
+                [
+                    "oscap",
+                    "xccdf",
+                    "eval",
+                    "--profile",
+                    profile,
+                    "--results",
+                    str(openscap_xml),
+                    "--report",
+                    str(openscap_html),
+                    str(datastream),
+                ],
+                use_sudo=True,
+                check=False,
+            )
+            openscap_meta["openscap_status"] = "completed"
+            openscap_meta["openscap_profile"] = profile
+            openscap_meta["openscap_datastream"] = str(datastream)
+            openscap_meta.update(parse_openscap_results(openscap_xml))
+        except Exception:
+            openscap_meta["openscap_status"] = "failed"
+    else:
+        openscap_meta["openscap_status"] = "datastream_not_found"
+
+    failed_rule_lines: List[str] = []
+    if openscap_xml.exists():
+        try:
+            tree = ET.parse(openscap_xml)
+        except ET.ParseError:
+            tree = None
+        if tree is not None:
+            root = tree.getroot()
+        else:
+            root = None
+    else:
+        root = None
+    if root is not None:
+        for elem in root.iter():
+            tag = elem.tag.split("}", 1)[-1]
+            if tag != "rule-result":
+                continue
+            rule_id = elem.attrib.get("idref", "N/A")
+            result_value = ""
+            for child in elem:
+                if child.tag.split("}", 1)[-1] == "result" and child.text:
+                    result_value = child.text.strip().lower()
+                    break
+            if result_value == "fail":
+                failed_rule_lines.append(f"openscap_failed_rule[]={rule_id}")
+
+    with openscap_data_path.open("w", encoding="utf-8") as handle:
+        handle.write("# OpenSCAP snapshot\n")
+        handle.write(f"openscap_datetime={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        for key, value in openscap_meta.items():
+            handle.write(f"{key}={value}\n")
+        for line in failed_rule_lines[:200]:
+            handle.write(line + "\n")
 
 
 def parse_skip_reasons_from_log(log_path: Path | None) -> Dict[str, List[str]]:
@@ -323,6 +566,7 @@ def render_html(
     report_path: Path,
     logo_data_uri: str,
     system_data: ParsedReport | None = None,
+    openscap_data: ParsedReport | None = None,
     log_path: Path | None = None,
 ) -> str:
     values = parsed.values
@@ -352,6 +596,8 @@ def render_html(
 
     sys_values = system_data.values if system_data else {}
     sys_arrays = system_data.arrays if system_data else {}
+    oscap_values = openscap_data.values if openscap_data else {}
+    oscap_arrays = openscap_data.arrays if openscap_data else {}
 
     timezone = sys_values.get("timezone", "Unknown")
     keyboard_layout = sys_values.get("keyboard_layout", "Unknown")
@@ -381,6 +627,7 @@ def render_html(
     suid_sgid_files = sys_arrays.get("suid_sgid_file", [])
     world_writable_files = sys_arrays.get("world_writable_file", [])
     cert_expiry = sys_arrays.get("cert_expiry", [])
+    openscap_failed_rules = oscap_arrays.get("openscap_failed_rule", [])
 
     recommendation_rows: List[str] = []
     for entry in suggestions:
@@ -393,17 +640,17 @@ def render_html(
             "</tr>"
         )
     if not recommendation_rows:
-        recommendation_rows.append("<tr><td colspan='3'>No recommendations found.</td></tr>")
+        recommendation_rows.append("<tr><td colspan='3'>Aucune recommandation detectee.</td></tr>")
 
     warning_items: List[str] = []
     for entry in warnings:
         test_id, message, _ = parse_recommendation(entry)
         warning_items.append(f"<li><strong>{escape(test_id)}</strong> - {escape(message)}</li>")
     if not warning_items:
-        warning_items.append("<li>No warnings in this report.</li>")
+        warning_items.append("<li>Aucune alerte critique.</li>")
 
     manual_items = [f"<li>{escape(item)}</li>" for item in manual_actions] or [
-        "<li>No manual verification tasks listed.</li>"
+        "<li>Aucune verification manuelle listee.</li>"
     ]
 
     user_rows: List[str] = []
@@ -421,7 +668,7 @@ def render_html(
             "</tr>"
         )
     if not user_rows:
-        user_rows.append("<tr><td colspan='5'>No user information available.</td></tr>")
+        user_rows.append("<tr><td colspan='5'>Aucune information utilisateur disponible.</td></tr>")
 
     path_rows: List[str] = []
     for entry in important_paths:
@@ -436,11 +683,11 @@ def render_html(
             "</tr>"
         )
     if not path_rows:
-        path_rows.append("<tr><td colspan='4'>No path permission information available.</td></tr>")
+        path_rows.append("<tr><td colspan='4'>Aucun chemin sensible disponible.</td></tr>")
 
     service_items = [f"<li>{escape(item)}</li>" for item in running_services] or ["<li>N/A</li>"]
     boot_service_items = [f"<li>{escape(item)}</li>" for item in boot_services] or ["<li>N/A</li>"]
-    locked_user_items = [f"<li>{escape(item)}</li>" for item in locked_users] or ["<li>None</li>"]
+    locked_user_items = [f"<li>{escape(item)}</li>" for item in locked_users] or ["<li>Aucun</li>"]
     home_dir_items = [f"<li>{escape(item)}</li>" for item in report_home_directories[:60]] or ["<li>N/A</li>"]
     fs_items = [f"<li>{escape(item)}</li>" for item in report_filesystems[:40]] or ["<li>N/A</li>"]
     mount_items = [f"<li>{escape(item)}</li>" for item in mount_info[:40]] or ["<li>N/A</li>"]
@@ -450,22 +697,27 @@ def render_html(
     sshd_effective_items = [f"<li>{escape(item)}</li>" for item in sshd_effective[:120]] or ["<li>N/A</li>"]
     security_sysctl_items = [f"<li>{escape(item)}</li>" for item in security_sysctl] or ["<li>N/A</li>"]
     upgradeable_package_items = [f"<li>{escape(item)}</li>" for item in upgradeable_packages[:300]] or [
-        "<li>No pending package update reported.</li>"
+        "<li>Aucune mise a jour en attente signalee.</li>"
     ]
     nft_rule_items = [f"<li>{escape(item)}</li>" for item in nft_rules[:260]] or ["<li>N/A</li>"]
     iptables_rule_items = [f"<li>{escape(item)}</li>" for item in iptables_rules[:260]] or ["<li>N/A</li>"]
     suid_sgid_items = [f"<li>{escape(item)}</li>" for item in suid_sgid_files[:300]] or ["<li>N/A</li>"]
-    world_writable_items = [f"<li>{escape(item)}</li>" for item in world_writable_files[:300]] or ["<li>None found in scanned paths.</li>"]
+    world_writable_items = [f"<li>{escape(item)}</li>" for item in world_writable_files[:300]] or [
+        "<li>Aucun fichier world-writable detecte dans l'echantillon.</li>"
+    ]
     cert_expiry_items = [f"<li>{escape(item)}</li>" for item in cert_expiry[:200]] or ["<li>N/A</li>"]
+    openscap_failed_rule_items = [f"<li>{escape(item)}</li>" for item in openscap_failed_rules[:200]] or [
+        "<li>Aucune regle en echec ou scan indisponible.</li>"
+    ]
 
     skipped_reason_map = parse_skip_reasons_from_log(log_path)
     test_rows, status_counts, priority_counts, actions, skipped_rows = build_test_rows(
         parsed, skipped_reason_map=skipped_reason_map
     )
     skipped_rows = skipped_rows or [
-        "<tr><td colspan='4'>No skipped tests found in this report.</td></tr>"
+        "<tr><td colspan='4'>Aucun test ignore detecte.</td></tr>"
     ]
-    top_actions = actions[:15]
+    top_actions = actions[:12]
     top_action_rows: List[str] = []
     for action in top_actions:
         top_action_rows.append(
@@ -478,489 +730,506 @@ def render_html(
             "</tr>"
         )
     if not top_action_rows:
-        top_action_rows.append("<tr><td colspan='5'>No action needed. All tests are passed.</td></tr>")
+        top_action_rows.append("<tr><td colspan='5'>Aucune action prioritaire. Tous les tests passent.</td></tr>")
 
-    logo_html = (
-        f"<img src='{logo_data_uri}' alt='Company logo' class='logo' />" if logo_data_uri else ""
-    )
+    total_checks = max(1, len(tests_executed) + len(tests_skipped))
+    pass_pct = int((status_counts["passed"] / total_checks) * 100)
+    warn_pct = int((status_counts["warning"] / total_checks) * 100)
+    sugg_pct = int((status_counts["suggestion"] / total_checks) * 100)
+    risk_level = "Eleve" if hardening_score < 60 else "Modere" if hardening_score < 80 else "Maitrise"
+    risk_css = "risk-high" if hardening_score < 60 else "risk-medium" if hardening_score < 80 else "risk-low"
+    openscap_status = oscap_values.get("openscap_status", "not_available")
+    openscap_profile = oscap_values.get("openscap_profile", "N/A")
+    openscap_total_rules = oscap_values.get("openscap_total_rules", "0")
+    openscap_passed_rules = oscap_values.get("openscap_passed_rules", "0")
+    openscap_failed_rules_count = oscap_values.get("openscap_failed_rules", "0")
+    openscap_error_rules = oscap_values.get("openscap_error_rules", "0")
+    openscap_datastream = oscap_values.get("openscap_datastream", "N/A")
+
+    logo_html = f"<img src='{logo_data_uri}' alt='Logo' class='logo' />" if logo_data_uri else ""
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Lynis Hardening Report - {escape(hostname)}</title>
+  <title>Rapport de durcissement Lynis - {escape(hostname)}</title>
   <style>
     :root {{
-      --bg1: #0f172a;
-      --bg2: #1e293b;
+      --bg: #f4f7fb;
       --surface: #ffffff;
-      --surface-soft: #f8fafc;
-      --text: #0b1220;
-      --muted: #64748b;
       --line: #e2e8f0;
-      --accent: #2563eb;
-      --danger: #dc2626;
+      --text: #0f172a;
+      --muted: #64748b;
+      --primary: #2563eb;
+      --ok: #16a34a;
       --warn: #d97706;
-      --good: #15803d;
-      --manual: #4338ca;
-      --p1: #b91c1c;
-      --p2: #b45309;
-      --p3: #0369a1;
+      --danger: #dc2626;
+      --violet: #7c3aed;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      background: linear-gradient(180deg, #eef4ff 0%, var(--bg) 240px, var(--bg) 100%);
       color: var(--text);
-      line-height: 1.55;
-      background: radial-gradient(circle at top right, #1d4ed8 0%, transparent 30%),
-                  linear-gradient(145deg, var(--bg1) 0%, var(--bg2) 40%, #0b1220 100%);
-      min-height: 100vh;
+      line-height: 1.5;
     }}
     .container {{
-      max-width: 1440px;
+      max-width: 1380px;
       margin: 0 auto;
-      padding: 26px;
+      padding: 24px;
     }}
-    .header {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 18px;
+    .hero {{
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 55%, #1d4ed8 100%);
+      color: #eff6ff;
       border-radius: 20px;
       padding: 22px;
-      background: linear-gradient(130deg, #111827 0%, #1f2937 60%, #0f172a 100%);
-      border: 1px solid rgba(148, 163, 184, 0.22);
-      color: #f8fafc;
-      box-shadow: 0 20px 45px rgba(2, 6, 23, 0.45);
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      box-shadow: 0 18px 40px rgba(30, 58, 138, 0.28);
     }}
-    .header h1 {{
+    .hero h1 {{
       margin: 0 0 8px;
-      font-size: 1.9rem;
-      letter-spacing: -0.03em;
+      letter-spacing: -0.02em;
+      font-size: 1.7rem;
     }}
-    .header .muted {{
-      color: #cbd5e1;
+    .hero p {{
+      margin: 0;
+      color: #dbeafe;
     }}
     .logo {{
-      max-height: 76px;
-      max-width: 280px;
-      object-fit: contain;
-      background: rgba(255, 255, 255, 0.08);
-      padding: 8px;
+      max-height: 72px;
+      max-width: 220px;
       border-radius: 10px;
+      background: rgba(255,255,255,0.16);
+      padding: 8px;
+    }}
+    .tabs {{
+      margin-top: 14px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .tab-btn {{
+      border: 1px solid #bfdbfe;
+      background: #ffffff;
+      color: #1d4ed8;
+      font-weight: 600;
+      border-radius: 999px;
+      padding: 8px 14px;
+      cursor: pointer;
+    }}
+    .tab-btn.active {{
+      color: #ffffff;
+      background: var(--primary);
+      border-color: var(--primary);
+    }}
+    .panel {{
+      display: none;
+      margin-top: 14px;
+    }}
+    .panel.active {{
+      display: block;
     }}
     .grid {{
-      margin-top: 16px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 14px;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
     }}
     .card {{
       background: var(--surface);
-      border: 1px solid rgba(226, 232, 240, 0.95);
-      border-radius: 16px;
-      padding: 18px;
-      box-shadow: 0 10px 24px rgba(2, 6, 23, 0.10);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
     }}
-    .score {{
-      font-size: 2.2rem;
+    .card h2 {{
+      margin: 0 0 8px;
+      font-size: 1rem;
+      letter-spacing: -0.01em;
+    }}
+    .kpi {{
+      font-size: 1.9rem;
       font-weight: 800;
-      margin: 6px 0;
       letter-spacing: -0.02em;
+      margin: 2px 0 4px;
     }}
-    .score-excellent {{ color: var(--good); }}
-    .score-good {{ color: #16a34a; }}
+    .muted {{ color: var(--muted); font-size: 0.92rem; }}
+    .score-excellent, .score-good {{ color: var(--ok); }}
     .score-fair {{ color: var(--warn); }}
     .score-poor {{ color: var(--danger); }}
-    .muted {{ color: var(--muted); font-size: 0.95rem; }}
-    section {{ margin-top: 16px; }}
-    .card h2 {{
-      margin: 0 0 10px;
-      font-size: 1.1rem;
-      letter-spacing: -0.02em;
+    .risk-pill {{
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 0.8rem;
+      font-weight: 700;
+    }}
+    .risk-high {{ background: #fee2e2; color: #991b1b; }}
+    .risk-medium {{ background: #fef3c7; color: #92400e; }}
+    .risk-low {{ background: #dcfce7; color: #166534; }}
+    .progress {{
+      height: 10px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      overflow: hidden;
+      margin-top: 8px;
+    }}
+    .progress > span {{
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, #2563eb 0%, #3b82f6 100%);
+    }}
+    .donut {{
+      width: 140px;
+      height: 140px;
+      margin: 0 auto;
+      border-radius: 50%;
+      background: conic-gradient(var(--ok) 0% {pass_pct}%, var(--warn) {pass_pct}% {pass_pct + sugg_pct}%, var(--danger) {pass_pct + sugg_pct}% {pass_pct + sugg_pct + warn_pct}%, #cbd5e1 {pass_pct + sugg_pct + warn_pct}% 100%);
+      position: relative;
+    }}
+    .donut::after {{
+      content: "{hardening_score}/100";
+      position: absolute;
+      inset: 18px;
+      border-radius: 50%;
+      background: #fff;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      color: #1e293b;
+      font-size: 1.2rem;
+    }}
+    .section {{
+      margin-top: 14px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+    }}
+    .section h3 {{
+      margin: 0 0 6px;
+      font-size: 1.05rem;
     }}
     table {{
       width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
+      border-collapse: collapse;
       font-size: 0.9rem;
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      overflow: hidden;
     }}
     th, td {{
       border-bottom: 1px solid var(--line);
-      padding: 10px;
+      padding: 9px;
       text-align: left;
       vertical-align: top;
     }}
     th {{
-      background: linear-gradient(180deg, #eff6ff 0%, #f8fafc 100%);
-      font-weight: 700;
-      font-size: 0.82rem;
+      background: #f8fafc;
+      font-size: 0.78rem;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       color: #334155;
     }}
     tr:last-child td {{ border-bottom: none; }}
-    tbody tr:hover td {{ background: #f8fbff; }}
     ul {{ margin: 0; padding-left: 18px; }}
     code {{
       background: #0f172a;
       color: #e2e8f0;
       border-radius: 6px;
-      padding: 2px 6px;
-      font-size: 0.88em;
-    }}
-    .kpi {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 8px;
+      padding: 1px 6px;
+      font-size: 0.85em;
     }}
     .badge {{
       display: inline-block;
-      font-size: 0.74rem;
-      font-weight: 700;
       border-radius: 999px;
       padding: 4px 10px;
-      letter-spacing: 0.03em;
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
     }}
     .status-passed {{ background: #dcfce7; color: #166534; }}
     .status-suggestion {{ background: #fef3c7; color: #92400e; }}
     .status-warning {{ background: #fee2e2; color: #991b1b; }}
-    .status-manual {{ background: #e0e7ff; color: var(--manual); }}
+    .status-manual {{ background: #ede9fe; color: #5b21b6; }}
     .status-skipped {{ background: #e2e8f0; color: #334155; }}
-    .priority-p1 {{ background: #fee2e2; color: var(--p1); }}
-    .priority-p2 {{ background: #ffedd5; color: var(--p2); }}
-    .priority-p3 {{ background: #e0f2fe; color: var(--p3); }}
-    .row-passed td {{ background: #f0fdf4; }}
-    .row-suggestion td {{ background: #fffbeb; }}
-    .row-warning td {{ background: #fff1f2; }}
-    .row-manual td {{ background: #eef2ff; }}
-    .row-skipped td {{ background: #f8fafc; }}
+    .priority-p1 {{ background: #fee2e2; color: #b91c1c; }}
+    .priority-p2 {{ background: #ffedd5; color: #b45309; }}
+    .priority-p3 {{ background: #e0f2fe; color: #0369a1; }}
     .controls {{
       display: flex;
-      flex-wrap: wrap;
       gap: 8px;
+      flex-wrap: wrap;
       margin: 10px 0;
     }}
     .filter-button {{
       border: 1px solid #cbd5e1;
       border-radius: 999px;
       background: #fff;
-      padding: 7px 13px;
+      padding: 7px 12px;
       cursor: pointer;
       font-size: 0.82rem;
-      transition: all 0.12s ease-in-out;
-      color: #334155;
     }}
     .filter-button.active {{
-      background: var(--accent);
-      border-color: var(--accent);
+      background: var(--primary);
+      border-color: var(--primary);
       color: #fff;
-      box-shadow: 0 8px 18px rgba(37, 99, 235, 0.25);
     }}
-    .filter-button:hover {{
-      transform: translateY(-1px);
-      border-color: #94a3b8;
+    details {{
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #fcfdff;
+    }}
+    details + details {{
+      margin-top: 10px;
+    }}
+    summary {{
+      cursor: pointer;
+      font-weight: 600;
+      color: #1e3a8a;
     }}
   </style>
 </head>
 <body>
   <div class="container">
-    <header class="header">
+    <header class="hero">
       <div>
-        <h1>Lynis Security Hardening Report</h1>
-        <p class="muted">Generated at {escape(generated_at)} from <code>{escape(str(report_path))}</code></p>
+        <h1>Rapport de durcissement Lynis</h1>
+        <p><strong>Hote:</strong> {escape(hostname)} | <strong>OS:</strong> {escape(os_name)}</p>
+        <p><strong>Genere le:</strong> {escape(generated_at)} | <strong>Source:</strong> <code>{escape(str(report_path))}</code></p>
       </div>
       <div>{logo_html}</div>
     </header>
 
-    <div class="grid">
-      <article class="card">
-        <h2>Target Host</h2>
-        <div><strong>{escape(hostname)}</strong></div>
-        <div class="muted">{escape(os_name)}</div>
-      </article>
-      <article class="card">
-        <h2>Hardening Score</h2>
-        <div class="score {escape(score_css)}">{hardening_score}/100</div>
-        <div class="muted">{escape(score_label)}</div>
-      </article>
-      <article class="card">
-        <h2>Scan Coverage</h2>
-        <div><strong>{tests_done}</strong> tests done</div>
-        <div class="muted">Executed IDs: {len(tests_executed)} | Skipped IDs: {len(tests_skipped)}</div>
-      </article>
-      <article class="card">
-        <h2>Scan Metadata</h2>
-        <div><strong>Lynis:</strong> {escape(lynis_version)}</div>
-        <div class="muted">{escape(started_at)} -> {escape(ended_at)}</div>
-      </article>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="machine" type="button">Information sur la machine</button>
+      <button class="tab-btn" data-tab="lynis" type="button">Scan Lynis</button>
+      <button class="tab-btn" data-tab="openscap" type="button">Scan OpenSCAP</button>
     </div>
 
-    <section class="card">
-      <h2>System Context (Extended Data)</h2>
+    <section id="panel-machine" class="panel active">
       <div class="grid">
         <article class="card">
-          <h2>Timezone and Locale</h2>
-          <div><strong>Timezone:</strong> {escape(timezone)}</div>
-          <div><strong>Locale:</strong> {escape(system_locale)}</div>
-          <div><strong>LANG:</strong> {escape(lang_value)}</div>
+          <h2>Niveau de securite global</h2>
+          <div class="kpi {escape(score_css)}">{hardening_score}/100</div>
+          <div class="risk-pill {risk_css}">Risque {risk_level}</div>
+          <div class="progress"><span style="width:{hardening_score}%"></span></div>
+          <div class="muted" style="margin-top: 6px;">Lecture rapide: {escape(score_label)}</div>
         </article>
         <article class="card">
-          <h2>Keyboard and Shell</h2>
-          <div><strong>Keyboard layout:</strong> {escape(keyboard_layout)}</div>
-          <div><strong>Keyboard model:</strong> {escape(keyboard_model)}</div>
-          <div><strong>Default shell:</strong> {escape(shell_value)}</div>
+          <h2>Repartition des resultats</h2>
+          <div class="donut"></div>
+          <div class="muted" style="margin-top:8px;">PASS: {status_counts["passed"]} | SUGGESTION: {status_counts["suggestion"]} | WARNING: {status_counts["warning"]}</div>
         </article>
         <article class="card">
-          <h2>Runtime State</h2>
-          <div><strong>Uptime:</strong> {escape(uptime_human)}</div>
-          <div><strong>Load average:</strong> {escape(load_average)}</div>
-          <div><strong>Total memory (kB):</strong> {escape(memory_total_kb)}</div>
+          <h2>Couverture du scan</h2>
+          <div class="kpi">{tests_done}</div>
+          <div class="muted">Tests executes: {len(tests_executed)} | Tests ignores: {len(tests_skipped)}</div>
+          <div class="muted">Lynis: {escape(lynis_version)}</div>
         </article>
         <article class="card">
-          <h2>Platform Security Signals</h2>
-          <div><strong>Package manager:</strong> {escape(package_manager_value)}</div>
-          <div><strong>Secure Boot:</strong> {escape(secure_boot_status)}</div>
-          <div><strong>TPM:</strong> {escape(tpm_status)}</div>
-          <div><strong>Encryption summary:</strong> {escape(encryption_summary)}</div>
+          <h2>Priorites d'action</h2>
+          <div><span class="badge priority-p1">P1: {priority_counts["P1"]}</span> <span class="badge priority-p2">P2: {priority_counts["P2"]}</span> <span class="badge priority-p3">P3: {priority_counts["P3"]}</span></div>
+          <div class="muted" style="margin-top: 8px;">Debut: {escape(started_at)}</div>
+          <div class="muted">Fin: {escape(ended_at)}</div>
         </article>
+      </div>
+
+      <div class="section">
+        <h3>Contexte plateforme (synthese)</h3>
+        <div class="grid">
+          <article class="card">
+            <h2>Environnement</h2>
+            <div><strong>Fuseau:</strong> {escape(timezone)}</div>
+            <div><strong>Locale:</strong> {escape(system_locale)}</div>
+            <div><strong>Shell:</strong> {escape(shell_value)}</div>
+            <div><strong>Uptime:</strong> {escape(uptime_human)}</div>
+          </article>
+          <article class="card">
+            <h2>Signaux securite</h2>
+            <div><strong>Package manager:</strong> {escape(package_manager_value)}</div>
+            <div><strong>Secure Boot:</strong> {escape(secure_boot_status)}</div>
+            <div><strong>TPM:</strong> {escape(tpm_status)}</div>
+          </article>
+          <article class="card">
+            <h2>Ressources</h2>
+            <div><strong>Load avg:</strong> {escape(load_average)}</div>
+            <div><strong>RAM totale (kB):</strong> {escape(memory_total_kb)}</div>
+            <div><strong>Clavier:</strong> {escape(keyboard_layout)} / {escape(keyboard_model)}</div>
+            <div><strong>LANG:</strong> {escape(lang_value)}</div>
+          </article>
+        </div>
       </div>
     </section>
 
-    <section class="card">
-      <h2>Patch and Hardening Hygiene</h2>
-      <div class="grid">
-        <article class="card">
-          <h2>Upgradeable Packages (sample)</h2>
-          <ul>{"".join(upgradeable_package_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>Security Sysctl Snapshot</h2>
-          <ul>{"".join(security_sysctl_items)}</ul>
-        </article>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Executive Summary</h2>
-      <p class="muted">This section highlights the most important hardening actions to communicate quickly with clients.</p>
-      <div class="kpi">
-        <span class="badge priority-p1">P1: {priority_counts["P1"]}</span>
-        <span class="badge priority-p2">P2: {priority_counts["P2"]}</span>
-        <span class="badge priority-p3">P3: {priority_counts["P3"]}</span>
-        <span class="badge status-warning">WARNING: {status_counts["warning"]}</span>
-        <span class="badge status-suggestion">SUGGESTION: {status_counts["suggestion"]}</span>
-        <span class="badge status-manual">MANUAL: {status_counts["manual"]}</span>
-        <span class="badge status-passed">PASSED: {status_counts["passed"]}</span>
-        <span class="badge status-skipped">SKIPPED: {status_counts["skipped"]}</span>
-      </div>
-      <table style="margin-top: 12px;">
-        <thead>
-          <tr>
-            <th>Priority</th>
-            <th>Test ID</th>
-            <th>Status</th>
-            <th>Finding</th>
-            <th>Recommendation</th>
-          </tr>
-        </thead>
-        <tbody>
-          {"".join(top_action_rows)}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="card">
-      <h2>Key Warnings</h2>
-      <ul>
-        {"".join(warning_items)}
-      </ul>
-    </section>
-
-    <section class="card">
-      <h2>Recommendations</h2>
-      <table>
-        <thead>
-          <tr><th>Test ID</th><th>Finding</th><th>Recommendation</th></tr>
-        </thead>
-        <tbody>
-          {"".join(recommendation_rows)}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="card">
-      <h2>Manual Verification Tasks</h2>
-      <ul>
-        {"".join(manual_items)}
-      </ul>
-    </section>
-
-    <section class="card">
-      <h2>Skipped Tests Analysis</h2>
-      <p class="muted">Reason source is <strong>log-based</strong> when available, otherwise heuristic from host context.</p>
-      <table>
-        <thead>
-          <tr><th>Test ID</th><th>Family</th><th>Reason</th><th>Source</th></tr>
-        </thead>
-        <tbody>
-          {"".join(skipped_rows)}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="card">
-      <h2>Users and Accounts</h2>
-      <table>
-        <thead>
-          <tr><th>User</th><th>UID</th><th>GID</th><th>Home</th><th>Shell</th></tr>
-        </thead>
-        <tbody>
-          {"".join(user_rows)}
-        </tbody>
-      </table>
-      <div class="grid" style="margin-top: 12px;">
-        <article class="card">
-          <h2>Locked Accounts</h2>
-          <ul>{"".join(locked_user_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>Home Directories (sample)</h2>
-          <ul>{"".join(home_dir_items)}</ul>
-        </article>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>File System and Important Paths</h2>
-      <table>
-        <thead>
-          <tr><th>Path</th><th>Perm</th><th>Owner</th><th>Group</th></tr>
-        </thead>
-        <tbody>
-          {"".join(path_rows)}
-        </tbody>
-      </table>
-      <div class="grid" style="margin-top: 12px;">
-        <article class="card">
-          <h2>Filesystem Entries (sample)</h2>
-          <ul>{"".join(fs_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>Mount Information (sample)</h2>
-          <ul>{"".join(mount_items)}</ul>
-        </article>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Services and Network Exposure</h2>
-      <div class="grid">
-        <article class="card">
-          <h2>Running Services</h2>
-          <ul>{"".join(service_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>Enabled at Boot</h2>
-          <ul>{"".join(boot_service_items)}</ul>
-        </article>
-      </div>
-      <div class="grid" style="margin-top: 12px;">
-        <article class="card">
-          <h2>Listening Endpoints (Lynis)</h2>
-          <ul>{"".join(network_listener_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>Open Ports Snapshot (ss)</h2>
-          <ul>{"".join(open_port_items)}</ul>
-        </article>
-      </div>
-      <article class="card" style="margin-top: 12px;">
-        <h2>Running Services Snapshot (systemd)</h2>
-        <ul>{"".join(running_service_full_items)}</ul>
-      </article>
-    </section>
-
-    <section class="card">
-      <h2>SSH and Firewall Deep Dive</h2>
-      <div class="grid">
-        <article class="card">
-          <h2>Effective SSH Configuration (sshd -T)</h2>
-          <ul>{"".join(sshd_effective_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>NFT Ruleset (sample)</h2>
-          <ul>{"".join(nft_rule_items)}</ul>
-        </article>
-      </div>
-      <article class="card" style="margin-top: 12px;">
-        <h2>iptables Ruleset (sample)</h2>
-        <ul>{"".join(iptables_rule_items)}</ul>
-      </article>
-    </section>
-
-    <section class="card">
-      <h2>File Exposure Indicators</h2>
-      <div class="grid">
-        <article class="card">
-          <h2>SUID/SGID Files (sample)</h2>
-          <ul>{"".join(suid_sgid_items)}</ul>
-        </article>
-        <article class="card">
-          <h2>World-Writable Files (sample)</h2>
-          <ul>{"".join(world_writable_items)}</ul>
-        </article>
-      </div>
-      <article class="card" style="margin-top: 12px;">
-        <h2>Certificate Expiry Snapshot</h2>
-        <ul>{"".join(cert_expiry_items)}</ul>
-      </article>
-    </section>
-
-    <section class="card">
-      <h2>Detailed Test Results</h2>
-      <p class="muted">Use filters to focus on specific statuses or priorities.</p>
-
-      <div class="controls" id="status-filters">
-        <button class="filter-button active" data-filter="all" type="button">All Statuses</button>
-        <button class="filter-button" data-filter="warning" type="button">Warning</button>
-        <button class="filter-button" data-filter="suggestion" type="button">Suggestion</button>
-        <button class="filter-button" data-filter="manual" type="button">Manual</button>
-        <button class="filter-button" data-filter="passed" type="button">Passed</button>
-        <button class="filter-button" data-filter="skipped" type="button">Skipped</button>
+    <section id="panel-lynis" class="panel">
+      <div class="section">
+        <h3>Plan d'action prioritaire (Lynis)</h3>
+        <p class="muted">Actions les plus importantes pour reduire rapidement le risque.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Priorite</th>
+              <th>Test</th>
+              <th>Type</th>
+              <th>Constat</th>
+              <th>Action conseillee</th>
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(top_action_rows)}
+          </tbody>
+        </table>
       </div>
 
-      <div class="controls" id="priority-filters">
-        <button class="filter-button active" data-priority-filter="all" type="button">All Priorities</button>
-        <button class="filter-button" data-priority-filter="P1" type="button">P1</button>
-        <button class="filter-button" data-priority-filter="P2" type="button">P2</button>
-        <button class="filter-button" data-priority-filter="P3" type="button">P3</button>
+      <div class="section">
+        <h3>Alertes clefs</h3>
+        <ul>{"".join(warning_items)}</ul>
       </div>
 
-      <table id="tests-table">
-        <thead>
-          <tr>
-            <th>Test ID</th>
-            <th>Status</th>
-            <th>Priority</th>
-            <th>Result Summary</th>
-            <th>Recommendation</th>
-            <th>Component</th>
-            <th>Technical Details</th>
-          </tr>
-        </thead>
-        <tbody>
-          {"".join(test_rows)}
-        </tbody>
-      </table>
+      <div class="section">
+        <h3>Filtrage des tests</h3>
+        <p class="muted">Vue complete pour investigation technique et suivi des remediations.</p>
+        <div class="controls" id="status-filters">
+          <button class="filter-button active" data-filter="all" type="button">Tous statuts</button>
+          <button class="filter-button" data-filter="warning" type="button">Warning</button>
+          <button class="filter-button" data-filter="suggestion" type="button">Suggestion</button>
+          <button class="filter-button" data-filter="manual" type="button">Manual</button>
+          <button class="filter-button" data-filter="passed" type="button">Passed</button>
+          <button class="filter-button" data-filter="skipped" type="button">Skipped</button>
+        </div>
+        <div class="controls" id="priority-filters">
+          <button class="filter-button active" data-priority-filter="all" type="button">Toutes priorites</button>
+          <button class="filter-button" data-priority-filter="P1" type="button">P1</button>
+          <button class="filter-button" data-priority-filter="P2" type="button">P2</button>
+          <button class="filter-button" data-priority-filter="P3" type="button">P3</button>
+        </div>
+        <table id="tests-table">
+          <thead>
+            <tr>
+              <th>Test ID</th>
+              <th>Status</th>
+              <th>Priorite</th>
+              <th>Resultat</th>
+              <th>Recommendation</th>
+              <th>Component</th>
+              <th>Details techniques</th>
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(test_rows)}
+          </tbody>
+        </table>
+      </div>
+
+      <details open>
+        <summary>Recommandations detaillees</summary>
+        <table style="margin-top:10px;">
+          <thead><tr><th>Test ID</th><th>Finding</th><th>Recommendation</th></tr></thead>
+          <tbody>{"".join(recommendation_rows)}</tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Taches de verification manuelle</summary>
+        <ul style="margin-top:10px;">{"".join(manual_items)}</ul>
+      </details>
+
+      <details>
+        <summary>Analyse des tests ignores</summary>
+        <table style="margin-top:10px;">
+          <thead><tr><th>Test ID</th><th>Famille</th><th>Raison</th><th>Source</th></tr></thead>
+          <tbody>{"".join(skipped_rows)}</tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Utilisateurs et comptes</summary>
+        <table style="margin-top:10px;">
+          <thead><tr><th>User</th><th>UID</th><th>GID</th><th>Home</th><th>Shell</th></tr></thead>
+          <tbody>{"".join(user_rows)}</tbody>
+        </table>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>Comptes verrouilles</h2><ul>{"".join(locked_user_items)}</ul></article>
+          <article class="card"><h2>Home directories (sample)</h2><ul>{"".join(home_dir_items)}</ul></article>
+        </div>
+      </details>
+
+      <details>
+        <summary>Filesystem et permissions</summary>
+        <table style="margin-top:10px;">
+          <thead><tr><th>Path</th><th>Perm</th><th>Owner</th><th>Group</th></tr></thead>
+          <tbody>{"".join(path_rows)}</tbody>
+        </table>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>Filesystems (sample)</h2><ul>{"".join(fs_items)}</ul></article>
+          <article class="card"><h2>Mounts (sample)</h2><ul>{"".join(mount_items)}</ul></article>
+        </div>
+      </details>
+
+      <details>
+        <summary>Services et exposition reseau</summary>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>Running services</h2><ul>{"".join(service_items)}</ul></article>
+          <article class="card"><h2>Enabled at boot</h2><ul>{"".join(boot_service_items)}</ul></article>
+        </div>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>Listeners (Lynis)</h2><ul>{"".join(network_listener_items)}</ul></article>
+          <article class="card"><h2>Open ports (ss)</h2><ul>{"".join(open_port_items)}</ul></article>
+        </div>
+        <article class="card" style="margin-top:10px;"><h2>systemd services</h2><ul>{"".join(running_service_full_items)}</ul></article>
+      </details>
+
+      <details>
+        <summary>SSH, firewall et hygiene systeme</summary>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>SSHD effectif</h2><ul>{"".join(sshd_effective_items)}</ul></article>
+          <article class="card"><h2>Sysctl securite</h2><ul>{"".join(security_sysctl_items)}</ul></article>
+        </div>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>Packages upgradables</h2><ul>{"".join(upgradeable_package_items)}</ul></article>
+          <article class="card"><h2>NFT rules (sample)</h2><ul>{"".join(nft_rule_items)}</ul></article>
+        </div>
+        <article class="card" style="margin-top:10px;"><h2>iptables rules (sample)</h2><ul>{"".join(iptables_rule_items)}</ul></article>
+      </details>
+
+      <details>
+        <summary>Indicateurs d'exposition fichiers</summary>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>SUID/SGID (sample)</h2><ul>{"".join(suid_sgid_items)}</ul></article>
+          <article class="card"><h2>World-writable (sample)</h2><ul>{"".join(world_writable_items)}</ul></article>
+        </div>
+        <article class="card" style="margin-top:10px;"><h2>Certificats (sample)</h2><ul>{"".join(cert_expiry_items)}</ul></article>
+      </details>
+    </section>
+
+    <section id="panel-openscap" class="panel">
+      <div class="section">
+        <h3>Resume OpenSCAP</h3>
+        <div class="grid">
+          <article class="card">
+            <h2>Statut du scan</h2>
+            <div class="kpi">{escape(openscap_status)}</div>
+            <div class="muted">Profil: {escape(openscap_profile)}</div>
+            <div class="muted">Datastream: <code>{escape(openscap_datastream)}</code></div>
+          </article>
+          <article class="card">
+            <h2>Regles evaluees</h2>
+            <div class="kpi">{escape(openscap_total_rules)}</div>
+            <div class="muted">Passees: {escape(openscap_passed_rules)}</div>
+            <div class="muted">En echec: {escape(openscap_failed_rules_count)}</div>
+            <div class="muted">Erreurs: {escape(openscap_error_rules)}</div>
+          </article>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Regles OpenSCAP en echec (echantillon)</h3>
+        <ul>{"".join(openscap_failed_rule_items)}</ul>
+      </div>
     </section>
   </div>
 
@@ -1002,6 +1271,17 @@ def render_html(
           applyFilters();
         }});
       }});
+
+      document.querySelectorAll(".tab-btn").forEach((btn) => {{
+        btn.addEventListener("click", () => {{
+          const tab = btn.getAttribute("data-tab");
+          document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          document.getElementById("panel-machine").classList.toggle("active", tab === "machine");
+          document.getElementById("panel-lynis").classList.toggle("active", tab === "lynis");
+          document.getElementById("panel-openscap").classList.toggle("active", tab === "openscap");
+        }});
+      }});
     }})();
   </script>
 </body>
@@ -1034,6 +1314,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional Lynis log file to extract skipped test reasons (default: infer from report name).",
     )
+    parser.add_argument(
+        "--openscap-data",
+        default=None,
+        help="Optional path to OpenSCAP snapshot data (default: infer from report name).",
+    )
+    parser.add_argument(
+        "--full-run",
+        action="store_true",
+        help="Install tools, run scans, collect data, and then generate the HTML report.",
+    )
     return parser
 
 
@@ -1042,8 +1332,25 @@ def main() -> int:
     args = parser.parse_args()
 
     report_path = Path(args.report)
-    if not report_path.exists():
+    inferred_system_path = default_system_data_path(report_path)
+    system_data_path = Path(args.system_data) if args.system_data else inferred_system_path
+    inferred_log_path = default_log_path(report_path)
+    log_path = Path(args.log_file) if args.log_file else inferred_log_path
+    inferred_openscap_path = default_openscap_data_path(report_path)
+    openscap_data_path = Path(args.openscap_data) if args.openscap_data else inferred_openscap_path
+
+    if args.full_run:
+        run_full_collection(
+            report_path=report_path,
+            log_path=log_path,
+            system_data_path=system_data_path,
+            openscap_data_path=openscap_data_path,
+        )
+    elif not report_path.exists():
         parser.error(f"Input report file not found: {report_path}")
+
+    if not report_path.exists():
+        parser.error(f"Expected report file not found after collection: {report_path}")
 
     parsed = parse_report_file(report_path)
     output_path = Path(args.output) if args.output else default_output_path(parsed)
@@ -1053,16 +1360,22 @@ def main() -> int:
     logo_data_uri = build_logo_data_uri(logo_path)
 
     system_data: ParsedReport | None = None
-    inferred_system_path = default_system_data_path(report_path)
-    system_data_path = Path(args.system_data) if args.system_data else inferred_system_path
     if system_data_path.exists():
         system_data = parse_report_file(system_data_path)
 
-    inferred_log_path = default_log_path(report_path)
-    log_path = Path(args.log_file) if args.log_file else inferred_log_path
+    openscap_data: ParsedReport | None = None
+    if openscap_data_path.exists():
+        openscap_data = parse_report_file(openscap_data_path)
 
     output_path.write_text(
-        render_html(parsed, report_path, logo_data_uri, system_data=system_data, log_path=log_path),
+        render_html(
+            parsed,
+            report_path,
+            logo_data_uri,
+            system_data=system_data,
+            openscap_data=openscap_data,
+            log_path=log_path,
+        ),
         encoding="utf-8",
     )
     print(f"HTML report successfully generated: {output_path}")

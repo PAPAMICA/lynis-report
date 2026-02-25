@@ -10,6 +10,9 @@ HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname || echo "unknown-host")"
 REPORT_FILE="${REPORTS_DIR}/report_${HOSTNAME_SHORT}_${DATE_STAMP}.dat"
 LOG_FILE="${RESULTS_DIR}/lynis_${HOSTNAME_SHORT}_${DATE_STAMP}.log"
 SYSTEM_SNAPSHOT_FILE="${REPORTS_DIR}/system_${HOSTNAME_SHORT}_${DATE_STAMP}.dat"
+OPENSCAP_SNAPSHOT_FILE="${REPORTS_DIR}/openscap_${HOSTNAME_SHORT}_${DATE_STAMP}.dat"
+OPENSCAP_RESULT_XML="${RESULTS_DIR}/openscap_${HOSTNAME_SHORT}_${DATE_STAMP}.xml"
+OPENSCAP_REPORT_HTML="${RESULTS_DIR}/openscap_${HOSTNAME_SHORT}_${DATE_STAMP}.html"
 
 require_sudo() {
   if command -v sudo >/dev/null 2>&1; then
@@ -74,6 +77,41 @@ install_lynis() {
   fi
 }
 
+install_openscap() {
+  if command -v oscap >/dev/null 2>&1; then
+    echo "[INFO] OpenSCAP is already installed."
+    return
+  fi
+
+  local as_root
+  as_root="$(require_sudo)"
+  echo "[INFO] OpenSCAP not found. Attempting installation..."
+
+  if command -v apt-get >/dev/null 2>&1; then
+    ${as_root} apt-get update
+    ${as_root} apt-get install -y openscap-scanner ssg-debderived || ${as_root} apt-get install -y openscap-scanner
+  elif command -v dnf >/dev/null 2>&1; then
+    ${as_root} dnf install -y openscap-scanner scap-security-guide
+  elif command -v yum >/dev/null 2>&1; then
+    ${as_root} yum install -y openscap-scanner scap-security-guide
+  elif command -v zypper >/dev/null 2>&1; then
+    ${as_root} zypper --non-interactive install openscap-utils scap-security-guide
+  elif command -v pacman >/dev/null 2>&1; then
+    ${as_root} pacman -Sy --noconfirm openscap
+  elif command -v apk >/dev/null 2>&1; then
+    ${as_root} apk add --no-cache openscap-scanner
+  else
+    echo "[ERROR] Unsupported Linux distribution: no known package manager found."
+    echo "[ERROR] Please install OpenSCAP manually and run this script again."
+    exit 1
+  fi
+
+  if ! command -v oscap >/dev/null 2>&1; then
+    echo "[ERROR] OpenSCAP installation failed."
+    exit 1
+  fi
+}
+
 run_audit() {
   local as_root
   as_root="$(require_sudo)"
@@ -91,6 +129,102 @@ run_audit() {
 
   echo "[INFO] Audit completed successfully."
   echo "[INFO] Generated report: ${REPORT_FILE}"
+}
+
+find_openscap_datastream() {
+  local candidates=(
+    "/usr/share/xml/scap/ssg/content/ssg-debian-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-ubuntu-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-centos8-ds.xml"
+  )
+  local path
+  for path in "${candidates[@]}"; do
+    if [[ -f "${path}" ]]; then
+      echo "${path}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_openscap_scan() {
+  local as_root
+  as_root="$(require_sudo)"
+
+  mkdir -p "${REPORTS_DIR}" "${RESULTS_DIR}"
+  local datastream
+  datastream="$(find_openscap_datastream || true)"
+  if [[ -z "${datastream}" ]]; then
+    echo "[WARN] OpenSCAP datastream not found. Skipping OpenSCAP scan."
+    {
+      echo "# OpenSCAP snapshot"
+      echo "openscap_datetime=$(date '+%Y-%m-%d %H:%M:%S')"
+      echo "openscap_status=datastream_not_found"
+      echo "openscap_profile=N/A"
+      echo "openscap_datastream=N/A"
+      echo "openscap_total_rules=0"
+      echo "openscap_passed_rules=0"
+      echo "openscap_failed_rules=0"
+      echo "openscap_error_rules=0"
+      echo "openscap_notchecked_rules=0"
+    } > "${OPENSCAP_SNAPSHOT_FILE}"
+    return
+  fi
+
+  local profile="xccdf_org.ssgproject.content_profile_standard"
+  echo "[INFO] Running OpenSCAP scan..."
+  echo "[INFO] Datastream: ${datastream}"
+  echo "[INFO] OpenSCAP results XML: ${OPENSCAP_RESULT_XML}"
+  echo "[INFO] OpenSCAP HTML report: ${OPENSCAP_REPORT_HTML}"
+
+  ${as_root} oscap xccdf eval \
+    --profile "${profile}" \
+    --results "${OPENSCAP_RESULT_XML}" \
+    --report "${OPENSCAP_REPORT_HTML}" \
+    "${datastream}" || true
+
+  local pass_count fail_count error_count notchecked_count notselected_count total_count
+  pass_count="$(rg -N -c "<result>pass</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
+  fail_count="$(rg -N -c "<result>fail</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
+  error_count="$(rg -N -c "<result>error</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
+  notchecked_count="$(rg -N -c "<result>notchecked</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
+  notselected_count="$(rg -N -c "<result>notselected</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
+  total_count=$((pass_count + fail_count + error_count + notchecked_count + notselected_count))
+
+  {
+    echo "# OpenSCAP snapshot"
+    echo "openscap_datetime=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "openscap_status=completed"
+    echo "openscap_profile=${profile}"
+    echo "openscap_datastream=${datastream}"
+    echo "openscap_total_rules=${total_count}"
+    echo "openscap_passed_rules=${pass_count}"
+    echo "openscap_failed_rules=${fail_count}"
+    echo "openscap_error_rules=${error_count}"
+    echo "openscap_notchecked_rules=$((notchecked_count + notselected_count))"
+
+    if [[ -f "${OPENSCAP_RESULT_XML}" ]]; then
+      python3 - <<'PY' "${OPENSCAP_RESULT_XML}"
+import re
+import sys
+from pathlib import Path
+
+content = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+rule_re = re.compile(r'<rule-result[^>]*idref="([^"]+)"[^>]*>.*?<result>([^<]+)</result>', re.DOTALL)
+count = 0
+for rid, status in rule_re.findall(content):
+    if status.strip().lower() == "fail":
+        print(f"openscap_failed_rule[]={rid}")
+        count += 1
+    if count >= 200:
+        break
+PY
+    fi
+  } > "${OPENSCAP_SNAPSHOT_FILE}"
+
+  echo "[INFO] OpenSCAP scan completed."
 }
 
 collect_system_snapshot() {
@@ -242,14 +376,22 @@ collect_system_snapshot() {
 }
 
 main() {
+  local mode="${1:-full}"
   if [[ "$(uname -s)" != "Linux" ]]; then
     echo "[ERROR] This script must be run on Linux."
     exit 1
   fi
 
+  if [[ "${mode}" == "--snapshot-only" ]]; then
+    collect_system_snapshot
+    return
+  fi
+
   install_lynis
+  install_openscap
   run_audit
   collect_system_snapshot
+  run_openscap_scan
 }
 
 main "$@"
