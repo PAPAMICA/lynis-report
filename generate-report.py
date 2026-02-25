@@ -221,7 +221,14 @@ def ensure_openscap_installed() -> None:
 
 def find_openscap_datastream() -> Path | None:
     candidates = [
+        "/usr/share/xml/scap/ssg/content/ssg-debian13-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-debian12-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-debian11-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-debian10-ds.xml",
         "/usr/share/xml/scap/ssg/content/ssg-debian-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-ubuntu2404-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-ubuntu2204-ds.xml",
+        "/usr/share/xml/scap/ssg/content/ssg-ubuntu2004-ds.xml",
         "/usr/share/xml/scap/ssg/content/ssg-ubuntu-ds.xml",
         "/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml",
         "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml",
@@ -230,6 +237,14 @@ def find_openscap_datastream() -> Path | None:
     for candidate in candidates:
         path = Path(candidate)
         if path.exists():
+            return path
+    for directory in (
+        Path("/usr/share/xml/scap/ssg/content"),
+        Path("/usr/local/share/xml/scap/ssg/content"),
+    ):
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("ssg-*-ds.xml")):
             return path
     return None
 
@@ -648,17 +663,17 @@ def render_html(
             "</tr>"
         )
     if not recommendation_rows:
-        recommendation_rows.append("<tr><td colspan='3'>Aucune recommandation detectee.</td></tr>")
+        recommendation_rows.append("<tr><td colspan='3'>No recommendations found.</td></tr>")
 
     warning_items: List[str] = []
     for entry in warnings:
         test_id, message, _ = parse_recommendation(entry)
         warning_items.append(f"<li><strong>{escape(test_id)}</strong> - {escape(message)}</li>")
     if not warning_items:
-        warning_items.append("<li>Aucune alerte critique.</li>")
+        warning_items.append("<li>No critical warnings found.</li>")
 
     manual_items = [f"<li>{escape(item)}</li>" for item in manual_actions] or [
-        "<li>Aucune verification manuelle listee.</li>"
+        "<li>No manual verification tasks listed.</li>"
     ]
 
     user_rows: List[str] = []
@@ -676,7 +691,7 @@ def render_html(
             "</tr>"
         )
     if not user_rows:
-        user_rows.append("<tr><td colspan='5'>Aucune information utilisateur disponible.</td></tr>")
+        user_rows.append("<tr><td colspan='5'>No user information available.</td></tr>")
 
     path_rows: List[str] = []
     for entry in important_paths:
@@ -691,11 +706,11 @@ def render_html(
             "</tr>"
         )
     if not path_rows:
-        path_rows.append("<tr><td colspan='4'>Aucun chemin sensible disponible.</td></tr>")
+        path_rows.append("<tr><td colspan='4'>No path permission information available.</td></tr>")
 
     service_items = [f"<li>{escape(item)}</li>" for item in running_services] or ["<li>N/A</li>"]
     boot_service_items = [f"<li>{escape(item)}</li>" for item in boot_services] or ["<li>N/A</li>"]
-    locked_user_items = [f"<li>{escape(item)}</li>" for item in locked_users] or ["<li>Aucun</li>"]
+    locked_user_items = [f"<li>{escape(item)}</li>" for item in locked_users] or ["<li>None</li>"]
     home_dir_items = [f"<li>{escape(item)}</li>" for item in report_home_directories[:60]] or ["<li>N/A</li>"]
     fs_items = [f"<li>{escape(item)}</li>" for item in report_filesystems[:40]] or ["<li>N/A</li>"]
     mount_items = [f"<li>{escape(item)}</li>" for item in mount_info[:40]] or ["<li>N/A</li>"]
@@ -705,17 +720,17 @@ def render_html(
     sshd_effective_items = [f"<li>{escape(item)}</li>" for item in sshd_effective[:120]] or ["<li>N/A</li>"]
     security_sysctl_items = [f"<li>{escape(item)}</li>" for item in security_sysctl] or ["<li>N/A</li>"]
     upgradeable_package_items = [f"<li>{escape(item)}</li>" for item in upgradeable_packages[:300]] or [
-        "<li>Aucune mise a jour en attente signalee.</li>"
+        "<li>No pending package updates reported.</li>"
     ]
     nft_rule_items = [f"<li>{escape(item)}</li>" for item in nft_rules[:260]] or ["<li>N/A</li>"]
     iptables_rule_items = [f"<li>{escape(item)}</li>" for item in iptables_rules[:260]] or ["<li>N/A</li>"]
     suid_sgid_items = [f"<li>{escape(item)}</li>" for item in suid_sgid_files[:300]] or ["<li>N/A</li>"]
     world_writable_items = [f"<li>{escape(item)}</li>" for item in world_writable_files[:300]] or [
-        "<li>Aucun fichier world-writable detecte dans l'echantillon.</li>"
+        "<li>No world-writable files found in sampled paths.</li>"
     ]
     cert_expiry_items = [f"<li>{escape(item)}</li>" for item in cert_expiry[:200]] or ["<li>N/A</li>"]
     openscap_failed_rule_items = [f"<li>{escape(item)}</li>" for item in openscap_failed_rules[:200]] or [
-        "<li>Aucune regle en echec ou scan indisponible.</li>"
+        "<li>No failed rules detected, or scan data unavailable.</li>"
     ]
 
     skipped_reason_map = parse_skip_reasons_from_log(log_path)
@@ -723,7 +738,7 @@ def render_html(
         parsed, skipped_reason_map=skipped_reason_map
     )
     skipped_rows = skipped_rows or [
-        "<tr><td colspan='4'>Aucun test ignore detecte.</td></tr>"
+        "<tr><td colspan='4'>No skipped tests found in this report.</td></tr>"
     ]
     top_actions = actions[:12]
     top_action_rows: List[str] = []
@@ -738,13 +753,13 @@ def render_html(
             "</tr>"
         )
     if not top_action_rows:
-        top_action_rows.append("<tr><td colspan='5'>Aucune action prioritaire. Tous les tests passent.</td></tr>")
+        top_action_rows.append("<tr><td colspan='5'>No priority actions. All tests passed.</td></tr>")
 
     total_checks = max(1, len(tests_executed) + len(tests_skipped))
     pass_pct = int((status_counts["passed"] / total_checks) * 100)
     warn_pct = int((status_counts["warning"] / total_checks) * 100)
     sugg_pct = int((status_counts["suggestion"] / total_checks) * 100)
-    risk_level = "Eleve" if hardening_score < 60 else "Modere" if hardening_score < 80 else "Maitrise"
+    risk_level = "High" if hardening_score < 60 else "Medium" if hardening_score < 80 else "Controlled"
     risk_css = "risk-high" if hardening_score < 60 else "risk-medium" if hardening_score < 80 else "risk-low"
     openscap_status = oscap_values.get("openscap_status", "not_available")
     openscap_profile = oscap_values.get("openscap_profile", "N/A")
@@ -753,16 +768,23 @@ def render_html(
     openscap_failed_rules_count = oscap_values.get("openscap_failed_rules", "0")
     openscap_error_rules = oscap_values.get("openscap_error_rules", "0")
     openscap_datastream = oscap_values.get("openscap_datastream", "N/A")
+    openscap_status_label = {
+        "completed": "Completed",
+        "failed": "Failed",
+        "datastream_not_found": "Datastream not found",
+        "not_run": "Not run",
+        "not_available": "Not available",
+    }.get(openscap_status, openscap_status)
 
     logo_html = f"<img src='{logo_data_uri}' alt='Logo' class='logo' />" if logo_data_uri else ""
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""<!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Rapport de durcissement Lynis - {escape(hostname)}</title>
+  <title>Lynis Hardening Report - {escape(hostname)}</title>
   <style>
     :root {{
       --bg: #f4f7fb;
@@ -1005,15 +1027,15 @@ def render_html(
   <div class="container">
     <header class="hero">
       <div>
-        <h1>Rapport de durcissement Lynis</h1>
-        <p><strong>Hote:</strong> {escape(hostname)} | <strong>OS:</strong> {escape(os_name)}</p>
-        <p><strong>Genere le:</strong> {escape(generated_at)} | <strong>Source:</strong> <code>{escape(str(report_path))}</code></p>
+        <h1>Lynis Hardening Report</h1>
+        <p><strong>Host:</strong> {escape(hostname)} | <strong>OS:</strong> {escape(os_name)}</p>
+        <p><strong>Generated at:</strong> {escape(generated_at)} | <strong>Source:</strong> <code>{escape(str(report_path))}</code></p>
       </div>
       <div>{logo_html}</div>
     </header>
 
     <div class="tabs">
-      <button class="tab-btn active" data-tab="machine" type="button">Information sur la machine</button>
+      <button class="tab-btn active" data-tab="machine" type="button">Machine Information</button>
       <button class="tab-btn" data-tab="lynis" type="button">Scan Lynis</button>
       <button class="tab-btn" data-tab="openscap" type="button">Scan OpenSCAP</button>
     </div>
@@ -1021,153 +1043,72 @@ def render_html(
     <section id="panel-machine" class="panel active">
       <div class="grid">
         <article class="card">
-          <h2>Niveau de securite global</h2>
+          <h2>Overall Security Level</h2>
           <div class="kpi {escape(score_css)}">{hardening_score}/100</div>
-          <div class="risk-pill {risk_css}">Risque {risk_level}</div>
+          <div class="risk-pill {risk_css}">Risk: {risk_level}</div>
           <div class="progress"><span style="width:{hardening_score}%"></span></div>
-          <div class="muted" style="margin-top: 6px;">Lecture rapide: {escape(score_label)}</div>
+          <div class="muted" style="margin-top: 6px;">Quick read: {escape(score_label)}</div>
         </article>
         <article class="card">
-          <h2>Repartition des resultats</h2>
+          <h2>Result Distribution</h2>
           <div class="donut"></div>
           <div class="muted" style="margin-top:8px;">PASS: {status_counts["passed"]} | SUGGESTION: {status_counts["suggestion"]} | WARNING: {status_counts["warning"]}</div>
         </article>
         <article class="card">
-          <h2>Couverture du scan</h2>
+          <h2>Scan Coverage</h2>
           <div class="kpi">{tests_done}</div>
-          <div class="muted">Tests executes: {len(tests_executed)} | Tests ignores: {len(tests_skipped)}</div>
+          <div class="muted">Executed tests: {len(tests_executed)} | Skipped tests: {len(tests_skipped)}</div>
           <div class="muted">Lynis: {escape(lynis_version)}</div>
         </article>
         <article class="card">
-          <h2>Priorites d'action</h2>
+          <h2>Action Priorities</h2>
           <div><span class="badge priority-p1">P1: {priority_counts["P1"]}</span> <span class="badge priority-p2">P2: {priority_counts["P2"]}</span> <span class="badge priority-p3">P3: {priority_counts["P3"]}</span></div>
-          <div class="muted" style="margin-top: 8px;">Debut: {escape(started_at)}</div>
-          <div class="muted">Fin: {escape(ended_at)}</div>
+          <div class="muted" style="margin-top: 8px;">Started: {escape(started_at)}</div>
+          <div class="muted">Finished: {escape(ended_at)}</div>
         </article>
       </div>
 
       <div class="section">
-        <h3>Contexte plateforme (synthese)</h3>
+        <h3>Platform Context (Summary)</h3>
         <div class="grid">
           <article class="card">
-            <h2>Environnement</h2>
-            <div><strong>Fuseau:</strong> {escape(timezone)}</div>
+            <h2>Environment</h2>
+            <div><strong>Timezone:</strong> {escape(timezone)}</div>
             <div><strong>Locale:</strong> {escape(system_locale)}</div>
             <div><strong>Shell:</strong> {escape(shell_value)}</div>
             <div><strong>Uptime:</strong> {escape(uptime_human)}</div>
           </article>
           <article class="card">
-            <h2>Signaux securite</h2>
+            <h2>Security Signals</h2>
             <div><strong>Package manager:</strong> {escape(package_manager_value)}</div>
             <div><strong>Secure Boot:</strong> {escape(secure_boot_status)}</div>
             <div><strong>TPM:</strong> {escape(tpm_status)}</div>
+            <div><strong>Disk encryption:</strong> {escape(encryption_summary)}</div>
           </article>
           <article class="card">
-            <h2>Ressources</h2>
+            <h2>Resources</h2>
             <div><strong>Load avg:</strong> {escape(load_average)}</div>
-            <div><strong>RAM totale (kB):</strong> {escape(memory_total_kb)}</div>
-            <div><strong>Clavier:</strong> {escape(keyboard_layout)} / {escape(keyboard_model)}</div>
+            <div><strong>Total RAM (kB):</strong> {escape(memory_total_kb)}</div>
+            <div><strong>Keyboard:</strong> {escape(keyboard_layout)} / {escape(keyboard_model)}</div>
             <div><strong>LANG:</strong> {escape(lang_value)}</div>
           </article>
         </div>
       </div>
-    </section>
-
-    <section id="panel-lynis" class="panel">
-      <div class="section">
-        <h3>Plan d'action prioritaire (Lynis)</h3>
-        <p class="muted">Actions les plus importantes pour reduire rapidement le risque.</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Priorite</th>
-              <th>Test</th>
-              <th>Type</th>
-              <th>Constat</th>
-              <th>Action conseillee</th>
-            </tr>
-          </thead>
-          <tbody>
-            {"".join(top_action_rows)}
-          </tbody>
-        </table>
-      </div>
-
-      <div class="section">
-        <h3>Alertes clefs</h3>
-        <ul>{"".join(warning_items)}</ul>
-      </div>
-
-      <div class="section">
-        <h3>Filtrage des tests</h3>
-        <p class="muted">Vue complete pour investigation technique et suivi des remediations.</p>
-        <div class="controls" id="status-filters">
-          <button class="filter-button active" data-filter="all" type="button">Tous statuts</button>
-          <button class="filter-button" data-filter="warning" type="button">Warning</button>
-          <button class="filter-button" data-filter="suggestion" type="button">Suggestion</button>
-          <button class="filter-button" data-filter="manual" type="button">Manual</button>
-          <button class="filter-button" data-filter="passed" type="button">Passed</button>
-          <button class="filter-button" data-filter="skipped" type="button">Skipped</button>
-        </div>
-        <div class="controls" id="priority-filters">
-          <button class="filter-button active" data-priority-filter="all" type="button">Toutes priorites</button>
-          <button class="filter-button" data-priority-filter="P1" type="button">P1</button>
-          <button class="filter-button" data-priority-filter="P2" type="button">P2</button>
-          <button class="filter-button" data-priority-filter="P3" type="button">P3</button>
-        </div>
-        <table id="tests-table">
-          <thead>
-            <tr>
-              <th>Test ID</th>
-              <th>Status</th>
-              <th>Priorite</th>
-              <th>Resultat</th>
-              <th>Recommendation</th>
-              <th>Component</th>
-              <th>Details techniques</th>
-            </tr>
-          </thead>
-          <tbody>
-            {"".join(test_rows)}
-          </tbody>
-        </table>
-      </div>
 
       <details open>
-        <summary>Recommandations detaillees</summary>
-        <table style="margin-top:10px;">
-          <thead><tr><th>Test ID</th><th>Finding</th><th>Recommendation</th></tr></thead>
-          <tbody>{"".join(recommendation_rows)}</tbody>
-        </table>
-      </details>
-
-      <details>
-        <summary>Taches de verification manuelle</summary>
-        <ul style="margin-top:10px;">{"".join(manual_items)}</ul>
-      </details>
-
-      <details>
-        <summary>Analyse des tests ignores</summary>
-        <table style="margin-top:10px;">
-          <thead><tr><th>Test ID</th><th>Famille</th><th>Raison</th><th>Source</th></tr></thead>
-          <tbody>{"".join(skipped_rows)}</tbody>
-        </table>
-      </details>
-
-      <details>
-        <summary>Utilisateurs et comptes</summary>
+        <summary>Users and Accounts</summary>
         <table style="margin-top:10px;">
           <thead><tr><th>User</th><th>UID</th><th>GID</th><th>Home</th><th>Shell</th></tr></thead>
           <tbody>{"".join(user_rows)}</tbody>
         </table>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>Comptes verrouilles</h2><ul>{"".join(locked_user_items)}</ul></article>
-          <article class="card"><h2>Home directories (sample)</h2><ul>{"".join(home_dir_items)}</ul></article>
+          <article class="card"><h2>Locked Accounts</h2><ul>{"".join(locked_user_items)}</ul></article>
+          <article class="card"><h2>Home Directories (sample)</h2><ul>{"".join(home_dir_items)}</ul></article>
         </div>
       </details>
 
       <details>
-        <summary>Filesystem et permissions</summary>
+        <summary>Filesystem, Mounts and Important Paths</summary>
         <table style="margin-top:10px;">
           <thead><tr><th>Path</th><th>Perm</th><th>Owner</th><th>Group</th></tr></thead>
           <tbody>{"".join(path_rows)}</tbody>
@@ -1179,63 +1120,147 @@ def render_html(
       </details>
 
       <details>
-        <summary>Services et exposition reseau</summary>
+        <summary>Services and Network Exposure</summary>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>Running services</h2><ul>{"".join(service_items)}</ul></article>
-          <article class="card"><h2>Enabled at boot</h2><ul>{"".join(boot_service_items)}</ul></article>
+          <article class="card"><h2>Running services (Lynis)</h2><ul>{"".join(service_items)}</ul></article>
+          <article class="card"><h2>Enabled at boot (Lynis)</h2><ul>{"".join(boot_service_items)}</ul></article>
         </div>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>Listeners (Lynis)</h2><ul>{"".join(network_listener_items)}</ul></article>
+          <article class="card"><h2>Listening endpoints (Lynis)</h2><ul>{"".join(network_listener_items)}</ul></article>
           <article class="card"><h2>Open ports (ss)</h2><ul>{"".join(open_port_items)}</ul></article>
         </div>
-        <article class="card" style="margin-top:10px;"><h2>systemd services</h2><ul>{"".join(running_service_full_items)}</ul></article>
+        <article class="card" style="margin-top:10px;"><h2>systemd running services</h2><ul>{"".join(running_service_full_items)}</ul></article>
       </details>
 
       <details>
-        <summary>SSH, firewall et hygiene systeme</summary>
+        <summary>Security Baseline Snapshot</summary>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>SSHD effectif</h2><ul>{"".join(sshd_effective_items)}</ul></article>
-          <article class="card"><h2>Sysctl securite</h2><ul>{"".join(security_sysctl_items)}</ul></article>
+          <article class="card"><h2>Security sysctl</h2><ul>{"".join(security_sysctl_items)}</ul></article>
+          <article class="card"><h2>SSH effective config (sshd -T)</h2><ul>{"".join(sshd_effective_items)}</ul></article>
         </div>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>Packages upgradables</h2><ul>{"".join(upgradeable_package_items)}</ul></article>
-          <article class="card"><h2>NFT rules (sample)</h2><ul>{"".join(nft_rule_items)}</ul></article>
+          <article class="card"><h2>Upgradeable packages</h2><ul>{"".join(upgradeable_package_items)}</ul></article>
+          <article class="card"><h2>Certificates expiry (sample)</h2><ul>{"".join(cert_expiry_items)}</ul></article>
         </div>
-        <article class="card" style="margin-top:10px;"><h2>iptables rules (sample)</h2><ul>{"".join(iptables_rule_items)}</ul></article>
+        <div class="grid" style="margin-top:10px;">
+          <article class="card"><h2>SUID/SGID files (sample)</h2><ul>{"".join(suid_sgid_items)}</ul></article>
+          <article class="card"><h2>World-writable files (sample)</h2><ul>{"".join(world_writable_items)}</ul></article>
+        </div>
+      </details>
+    </section>
+
+    <section id="panel-lynis" class="panel">
+      <div class="section">
+        <h3>Priority Action Plan (Lynis)</h3>
+        <p class="muted">Most important actions to reduce risk quickly.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Priority</th>
+              <th>Test</th>
+              <th>Type</th>
+              <th>Finding</th>
+              <th>Recommended Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(top_action_rows)}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h3>Key Warnings</h3>
+        <ul>{"".join(warning_items)}</ul>
+      </div>
+
+      <div class="section">
+        <h3>Test Filters</h3>
+        <p class="muted">Full view for technical analysis and remediation tracking.</p>
+        <div class="controls" id="status-filters">
+          <button class="filter-button active" data-filter="all" type="button">All statuses</button>
+          <button class="filter-button" data-filter="warning" type="button">Warning</button>
+          <button class="filter-button" data-filter="suggestion" type="button">Suggestion</button>
+          <button class="filter-button" data-filter="manual" type="button">Manual</button>
+          <button class="filter-button" data-filter="passed" type="button">Passed</button>
+          <button class="filter-button" data-filter="skipped" type="button">Skipped</button>
+        </div>
+        <div class="controls" id="priority-filters">
+          <button class="filter-button active" data-priority-filter="all" type="button">All priorities</button>
+          <button class="filter-button" data-priority-filter="P1" type="button">P1</button>
+          <button class="filter-button" data-priority-filter="P2" type="button">P2</button>
+          <button class="filter-button" data-priority-filter="P3" type="button">P3</button>
+        </div>
+        <table id="tests-table">
+          <thead>
+            <tr>
+              <th>Test ID</th>
+              <th>Status</th>
+              <th>Priority</th>
+              <th>Result</th>
+              <th>Recommendation</th>
+              <th>Component</th>
+              <th>Technical details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(test_rows)}
+          </tbody>
+        </table>
+      </div>
+
+      <details open>
+        <summary>Detailed recommendations</summary>
+        <table style="margin-top:10px;">
+          <thead><tr><th>Test ID</th><th>Finding</th><th>Recommendation</th></tr></thead>
+          <tbody>{"".join(recommendation_rows)}</tbody>
+        </table>
       </details>
 
       <details>
-        <summary>Indicateurs d'exposition fichiers</summary>
+        <summary>Manual verification tasks</summary>
+        <ul style="margin-top:10px;">{"".join(manual_items)}</ul>
+      </details>
+
+      <details>
+        <summary>Skipped tests analysis</summary>
+        <table style="margin-top:10px;">
+          <thead><tr><th>Test ID</th><th>Family</th><th>Reason</th><th>Source</th></tr></thead>
+          <tbody>{"".join(skipped_rows)}</tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Firewall rulesets (sample)</summary>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>SUID/SGID (sample)</h2><ul>{"".join(suid_sgid_items)}</ul></article>
-          <article class="card"><h2>World-writable (sample)</h2><ul>{"".join(world_writable_items)}</ul></article>
+          <article class="card"><h2>NFT rules</h2><ul>{"".join(nft_rule_items)}</ul></article>
+          <article class="card"><h2>iptables rules</h2><ul>{"".join(iptables_rule_items)}</ul></article>
         </div>
-        <article class="card" style="margin-top:10px;"><h2>Certificats (sample)</h2><ul>{"".join(cert_expiry_items)}</ul></article>
       </details>
     </section>
 
     <section id="panel-openscap" class="panel">
       <div class="section">
-        <h3>Resume OpenSCAP</h3>
+        <h3>OpenSCAP Summary</h3>
         <div class="grid">
           <article class="card">
-            <h2>Statut du scan</h2>
-            <div class="kpi">{escape(openscap_status)}</div>
-            <div class="muted">Profil: {escape(openscap_profile)}</div>
+            <h2>Scan status</h2>
+            <div class="kpi">{escape(openscap_status_label)}</div>
+            <div class="muted">Profile: {escape(openscap_profile)}</div>
             <div class="muted">Datastream: <code>{escape(openscap_datastream)}</code></div>
           </article>
           <article class="card">
-            <h2>Regles evaluees</h2>
+            <h2>Evaluated rules</h2>
             <div class="kpi">{escape(openscap_total_rules)}</div>
-            <div class="muted">Passees: {escape(openscap_passed_rules)}</div>
-            <div class="muted">En echec: {escape(openscap_failed_rules_count)}</div>
-            <div class="muted">Erreurs: {escape(openscap_error_rules)}</div>
+            <div class="muted">Passed: {escape(openscap_passed_rules)}</div>
+            <div class="muted">Failed: {escape(openscap_failed_rules_count)}</div>
+            <div class="muted">Errors: {escape(openscap_error_rules)}</div>
           </article>
         </div>
       </div>
 
       <div class="section">
-        <h3>Regles OpenSCAP en echec (echantillon)</h3>
+        <h3>OpenSCAP failed rules (sample)</h3>
         <ul>{"".join(openscap_failed_rule_items)}</ul>
       </div>
     </section>

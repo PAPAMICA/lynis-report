@@ -133,7 +133,14 @@ run_audit() {
 
 find_openscap_datastream() {
   local candidates=(
+    "/usr/share/xml/scap/ssg/content/ssg-debian13-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-debian12-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-debian11-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-debian10-ds.xml"
     "/usr/share/xml/scap/ssg/content/ssg-debian-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-ubuntu2404-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-ubuntu2204-ds.xml"
+    "/usr/share/xml/scap/ssg/content/ssg-ubuntu2004-ds.xml"
     "/usr/share/xml/scap/ssg/content/ssg-ubuntu-ds.xml"
     "/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml"
     "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml"
@@ -141,6 +148,13 @@ find_openscap_datastream() {
   )
   local path
   for path in "${candidates[@]}"; do
+    if [[ -f "${path}" ]]; then
+      echo "${path}"
+      return 0
+    fi
+  done
+
+  for path in /usr/share/xml/scap/ssg/content/ssg-*-ds.xml /usr/local/share/xml/scap/ssg/content/ssg-*-ds.xml; do
     if [[ -f "${path}" ]]; then
       echo "${path}"
       return 0
