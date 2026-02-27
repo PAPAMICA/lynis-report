@@ -18,7 +18,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -724,8 +724,8 @@ def collect_cert_expiry(limit: int = 80) -> List[Dict[str, str]]:
                 enddate = ln.replace("notAfter=", "").strip()
         status = "ok"
         try:
-            exp = datetime.strptime(enddate, "%b %d %H:%M:%S %Y %Z")
-            days = (exp - datetime.utcnow()).days
+            exp = datetime.strptime(enddate, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+            days = (exp - datetime.now(timezone.utc)).days
             status = "expired" if days < 0 else ("warn" if days <= 30 else "ok")
         except Exception:
             days = None

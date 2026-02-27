@@ -1,6 +1,6 @@
-#################################################################################
+################################################################################
 #
-#  Lynis — Custom Hardening Profile
+#  Lynis - Custom Hardening Profile
 #
 #  Purpose : Extend the default.prf with additional sysctl checks,
 #             stricter file-permission audits and compliance mappings
@@ -14,16 +14,16 @@
 #            not already present.  This file is read AFTER default.prf
 #            and overrides matching keys.
 #
-#################################################################################
+################################################################################
 
 
-#################################################################################
+################################################################################
 # General settings
-#################################################################################
+################################################################################
 
-profile-name=Server Hardening Audit — Custom Profile
+profile-name=Server Hardening Audit - Custom Profile
 
-# Full scan — test everything
+# Full scan - test everything
 test-scan-mode=full
 
 # Role: production server (influences which tests are relevant)
@@ -42,16 +42,16 @@ show-report-solution=yes
 compliance-standards=cis,hipaa,iso27001,pci-dss
 
 
-#################################################################################
-# Additional sysctl — Kernel hardening
-#################################################################################
+################################################################################
+# Additional sysctl - Kernel hardening
+################################################################################
 
-# --- Process isolation & memory protection ---
+# --- Process isolation and memory protection ---
 config-data=sysctl;kernel.unprivileged_userns_clone;0;1;Prevent unprivileged users from creating user namespaces (reduces attack surface);sysctl -a;url:https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html;category:security;
-config-data=sysctl;kernel.nmi_watchdog;0;1;Disable NMI watchdog — avoids leaking kernel timing info;sysctl -a;-;category:security;
-config-data=sysctl;kernel.panic;60;1;Reboot automatically 60 s after kernel panic to reduce downtime risk;sysctl -a;-;category:availability;
+config-data=sysctl;kernel.nmi_watchdog;0;1;Disable NMI watchdog to avoid leaking kernel timing info;sysctl -a;-;category:security;
+config-data=sysctl;kernel.panic;60;1;Reboot automatically 60s after kernel panic to reduce downtime risk;sysctl -a;-;category:availability;
 config-data=sysctl;kernel.panic_on_oops;60;1;Reboot after kernel oops to ensure clean state;sysctl -a;-;category:availability;
-config-data=sysctl;kernel.io_uring_disabled;2;1;Disable io_uring completely — frequently exploited for privilege escalation;sysctl -a;url:https://security.googleblog.com/2023/06/learnings-from-googles-team-targeting.html;category:security;
+config-data=sysctl;kernel.io_uring_disabled;2;1;Disable io_uring completely - frequently exploited for privilege escalation;sysctl -a;url:https://security.googleblog.com/2023/06/learnings-from-googles-team-targeting.html;category:security;
 
 # --- ASLR entropy (stronger randomisation) ---
 config-data=sysctl;vm.mmap_rnd_bits;32;1;Increase ASLR entropy for mmap (64-bit);sysctl -a;-;category:security;
@@ -62,11 +62,11 @@ config-data=sysctl;vm.swappiness;10;1;Limit swap usage to reduce sensitive data 
 config-data=sysctl;vm.dirty_ratio;10;1;Limit dirty pages to avoid large memory spills;sysctl -a;-;category:security;
 
 
-#################################################################################
-# Additional sysctl — Network hardening
-#################################################################################
+################################################################################
+# Additional sysctl - Network hardening
+################################################################################
 
-# --- IPv4 — Redirect & source-route hardening ---
+# --- IPv4 - Redirect and source-route hardening ---
 config-data=sysctl;net.ipv4.conf.all.secure_redirects;0;1;Reject ICMP redirects even from gateways listed in the route table;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv4.conf.default.secure_redirects;0;1;Reject ICMP redirects on new interfaces;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv4.conf.default.accept_redirects;0;1;Disable ICMP redirects on new interfaces;sysctl -a;-;category:security;
@@ -76,27 +76,27 @@ config-data=sysctl;net.ipv4.conf.default.forwarding;0;1;Disable IP forwarding on
 config-data=sysctl;net.ipv4.conf.all.shared_media;0;1;Assume network interfaces are not shared media;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv4.conf.default.shared_media;0;1;Assume new interfaces are not shared media;sysctl -a;-;category:security;
 
-# --- IPv4 — TCP hardening ---
+# --- IPv4 - TCP hardening ---
 config-data=sysctl;net.ipv4.tcp_rfc1337;1;1;Protect against TIME_WAIT assassination hazards (RFC 1337);sysctl -a;url:https://www.rfc-editor.org/rfc/rfc1337;category:security;
 config-data=sysctl;net.ipv4.tcp_syn_retries;2;1;Limit SYN retransmits to reduce half-open connection exposure;sysctl -a;-;category:security;
-config-data=sysctl;net.ipv4.tcp_synack_retries;2;1;Limit SYN-ACK retransmits — mitigates SYN flood amplification;sysctl -a;-;category:security;
+config-data=sysctl;net.ipv4.tcp_synack_retries;2;1;Limit SYN-ACK retransmits to mitigate SYN flood amplification;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv4.tcp_max_syn_backlog;4096;1;Increase SYN backlog to absorb burst SYN floods;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv4.tcp_fin_timeout;15;1;Shorten FIN_WAIT_2 timeout to free sockets faster;sysctl -a;-;category:security;
 
-# --- IPv6 — Disable if not used ---
+# --- IPv6 - Disable if not used ---
 config-data=sysctl;net.ipv6.conf.all.accept_ra;0;1;Disable IPv6 Router Advertisement processing to prevent rogue RA attacks;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv6.conf.default.accept_ra;0;1;Disable IPv6 RA on new interfaces;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv6.conf.all.accept_redirects;0;1;Disable IPv6 ICMP redirects;sysctl -a;-;category:security;
 config-data=sysctl;net.ipv6.conf.default.accept_redirects;0;1;Disable IPv6 ICMP redirects on new interfaces;sysctl -a;-;category:security;
-config-data=sysctl;net.ipv6.conf.all.use_tempaddr;2;1;Use temporary (privacy) addresses for outbound IPv6 connections;sysctl -a;url:https://www.rfc-editor.org/rfc/rfc4941;category:privacy;
+config-data=sysctl;net.ipv6.conf.all.use_tempaddr;2;1;Use temporary privacy addresses for outbound IPv6 connections;sysctl -a;url:https://www.rfc-editor.org/rfc/rfc4941;category:privacy;
 
 # --- Misc network ---
-config-data=sysctl;net.core.bpf_jit_harden;2;1;Enable hardened BPF JIT (pointer masking, constant blinding);sysctl -a;-;category:security;
+config-data=sysctl;net.core.bpf_jit_harden;2;1;Enable hardened BPF JIT with pointer masking and constant blinding;sysctl -a;-;category:security;
 
 
-#################################################################################
-# File permission checks — critical system files
-#################################################################################
+################################################################################
+# File permission checks - critical system files
+################################################################################
 
 # Shadow / password databases
 permfile=/etc/shadow:rw-r-----:root:shadow:WARN:
@@ -132,9 +132,9 @@ permfile=/etc/iptables/rules.v4:rw-------:root:root:WARN:
 permfile=/etc/iptables/rules.v6:rw-------:root:root:WARN:
 
 
-#################################################################################
+################################################################################
 # Directory permission checks
-#################################################################################
+################################################################################
 
 # sudo drop-in directory
 permdir=/etc/sudoers.d:rwx------:root:root:WARN:
@@ -146,20 +146,17 @@ permdir=/var/log/audit:rwx------:root:root:WARN:
 # Log directories
 permdir=/var/log:rwxr-xr-x:root:root:WARN:
 
-# Temporary directories — must have sticky bit
+# Temporary directories - must have sticky bit
 permdir=/tmp:rwxrwxrwt:root:root:WARN:
 permdir=/var/tmp:rwxrwxrwt:root:root:WARN:
 
 # sysctl drop-in directory
 permdir=/etc/sysctl.d:rwxr-xr-x:root:root:WARN:
 
-# cron — already in default.prf, kept here as reminders
-# permdir=/etc/cron.d:rwx------:root:root:WARN:
 
-
-#################################################################################
+################################################################################
 # Tests to skip (uncomment if not applicable to your environment)
-#################################################################################
+################################################################################
 
 # If IPv6 is intentionally disabled at kernel level, skip the IPv6 routing tests
 #skip-test=NETW-3015
