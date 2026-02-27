@@ -197,10 +197,12 @@ FILES = [
     "/etc/sysctl.conf",
 ]
 
-MAX_PREVIEW = 1600
+MAX_PREVIEW = 2200
 
-def one_line(value: str) -> str:
-    return " ".join(value.replace("\r", "\n").splitlines())
+def pretty_preview(value: str) -> str:
+    lines = value.replace("\r", "").split("\n")
+    kept = lines[:40]
+    return "\\n".join(kept)
 
 for file_path in FILES:
     path = Path(file_path)
@@ -213,9 +215,9 @@ for file_path in FILES:
         group = grp.getgrgid(st.st_gid).gr_name
         mode = oct(st.st_mode & 0o777).replace("0o", "")
         content = path.read_text(encoding="utf-8", errors="replace")
-        preview = one_line(content[:MAX_PREVIEW])
+        preview = pretty_preview(content[:MAX_PREVIEW])
         if len(content) > MAX_PREVIEW:
-            preview += " ...[truncated]"
+            preview += "\\n...[truncated]"
         print(
             "important_file[]="
             + f"{file_path}|present=yes|mode={mode}|owner={owner}|group={group}|size={st.st_size}|preview={preview}"

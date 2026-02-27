@@ -487,6 +487,7 @@ def render_html(
         )
     if not recommendation_rows:
         recommendation_rows.append("<tr><td colspan='3'>No recommendations found.</td></tr>")
+    recommendation_rows = recommendation_rows[:120]
 
     warning_items: List[str] = []
     for entry in warnings:
@@ -579,6 +580,13 @@ def render_html(
         )
     if not service_status_rows:
         service_status_rows.append("<tr><td colspan='6'>No service status information available.</td></tr>")
+    else:
+        service_total_count = len(service_status_rows)
+        service_status_rows = service_status_rows[:350]
+        if service_total_count > 350:
+            service_status_rows.append(
+                f"<tr><td colspan='6'>Showing first 350 services out of {service_total_count}.</td></tr>"
+            )
 
     important_file_rows: List[str] = []
     for entry in important_file_entries:
@@ -590,6 +598,7 @@ def render_html(
                 continue
             key, value = item.split("=", 1)
             kv[key.strip()] = value.strip()
+        preview_text = kv.get("preview", kv.get("error", "N/A")).replace("\\n", "\n")
         important_file_rows.append(
             "<tr>"
             f"<td>{escape(file_path)}</td>"
@@ -597,7 +606,7 @@ def render_html(
             f"<td>{escape(kv.get('mode', 'N/A'))}</td>"
             f"<td>{escape(kv.get('owner', 'N/A'))}:{escape(kv.get('group', 'N/A'))}</td>"
             f"<td>{escape(kv.get('size', 'N/A'))}</td>"
-            f"<td><code>{escape(kv.get('preview', kv.get('error', 'N/A')))}</code></td>"
+            f"<td><pre class='preview'>{escape(preview_text)}</pre></td>"
             "</tr>"
         )
     if not important_file_rows:
@@ -633,6 +642,13 @@ def render_html(
     test_rows, status_counts, priority_counts, actions, skipped_rows = build_test_rows(
         parsed, skipped_reason_map=skipped_reason_map
     )
+    skipped_total_count = len(skipped_rows)
+    if skipped_rows:
+        skipped_rows = skipped_rows[:180]
+        if skipped_total_count > 180:
+            skipped_rows.append(
+                f"<tr><td colspan='4'>Showing first 180 skipped tests out of {skipped_total_count}.</td></tr>"
+            )
     skipped_rows = skipped_rows or [
         "<tr><td colspan='4'>No skipped tests found in this report.</td></tr>"
     ]
@@ -831,12 +847,14 @@ def render_html(
       width: 100%;
       border-collapse: collapse;
       font-size: 0.9rem;
+      table-layout: fixed;
     }}
     th, td {{
       border-bottom: 1px solid var(--line);
       padding: 9px;
       text-align: left;
       vertical-align: top;
+      word-break: break-word;
     }}
     th {{
       background: #f8fafc;
@@ -853,6 +871,41 @@ def render_html(
       border-radius: 6px;
       padding: 1px 6px;
       font-size: 0.85em;
+      white-space: pre-wrap;
+    }}
+    .table-wrap {{
+      overflow: auto;
+      max-height: 580px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }}
+    .table-wrap table {{
+      border-collapse: separate;
+      border-spacing: 0;
+      width: 100%;
+    }}
+    .table-wrap thead th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    .compact-note {{
+      margin-top: 8px;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }}
+    .preview {{
+      max-height: 140px;
+      overflow: auto;
+      margin: 0;
+      padding: 8px;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.8rem;
     }}
     .badge {{
       display: inline-block;
@@ -962,14 +1015,16 @@ def render_html(
       <div class="section">
         <h3>User Access and Authentication Matrix</h3>
         <p class="muted">Includes shell access, SSH eligibility, account state, allowed methods, and authorized key footprint.</p>
-        <table>
-          <thead>
-            <tr>
-              <th>User</th><th>UID</th><th>Shell</th><th>Password state</th><th>SSH allowed</th><th>Possible methods</th><th>Authorized keys</th><th>Groups</th><th>Key preview</th>
-            </tr>
-          </thead>
-          <tbody>{"".join(user_auth_rows)}</tbody>
-        </table>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>User</th><th>UID</th><th>Shell</th><th>Password state</th><th>SSH allowed</th><th>Possible methods</th><th>Authorized keys</th><th>Groups</th><th>Key preview</th>
+              </tr>
+            </thead>
+            <tbody>{"".join(user_auth_rows)}</tbody>
+          </table>
+        </div>
       </div>
 
       <details open>
@@ -1007,12 +1062,14 @@ def render_html(
           <article class="card"><h2>Open ports (ss)</h2><ul>{"".join(open_port_items)}</ul></article>
         </div>
         <article class="card" style="margin-top:10px;"><h2>systemd running services</h2><ul>{"".join(running_service_full_items)}</ul></article>
-        <table style="margin-top:10px;">
-          <thead>
-            <tr><th>Service</th><th>Load</th><th>Active</th><th>Sub</th><th>Enabled</th><th>Description</th></tr>
-          </thead>
-          <tbody>{"".join(service_status_rows)}</tbody>
-        </table>
+        <div class="table-wrap" style="margin-top:10px;">
+          <table>
+            <thead>
+              <tr><th>Service</th><th>Load</th><th>Active</th><th>Sub</th><th>Enabled</th><th>Description</th></tr>
+            </thead>
+            <tbody>{"".join(service_status_rows)}</tbody>
+          </table>
+        </div>
       </details>
 
       <details>
@@ -1028,14 +1085,16 @@ def render_html(
       <details>
         <summary>Critical Configuration Files Snapshot</summary>
         <p class="muted" style="margin-top:8px;">Includes MOTD, SSH, PAM, sudoers, audit, logging, and kernel tuning related files.</p>
-        <table style="margin-top:10px;">
-          <thead>
-            <tr>
-              <th>File</th><th>Present</th><th>Mode</th><th>Owner</th><th>Size</th><th>Content Preview</th>
-            </tr>
-          </thead>
-          <tbody>{"".join(important_file_rows)}</tbody>
-        </table>
+        <div class="table-wrap" style="margin-top:10px;">
+          <table>
+            <thead>
+              <tr>
+                <th>File</th><th>Present</th><th>Mode</th><th>Owner</th><th>Size</th><th>Content Preview</th>
+              </tr>
+            </thead>
+            <tbody>{"".join(important_file_rows)}</tbody>
+          </table>
+        </div>
       </details>
     </section>
 
@@ -1043,20 +1102,22 @@ def render_html(
       <div class="section">
         <h3>Priority Action Plan (Lynis)</h3>
         <p class="muted">Most important actions to reduce risk quickly.</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Priority</th>
-              <th>Test</th>
-              <th>Type</th>
-              <th>Finding</th>
-              <th>Recommended Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {"".join(top_action_rows)}
-          </tbody>
-        </table>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Priority</th>
+                <th>Test</th>
+                <th>Type</th>
+                <th>Finding</th>
+                <th>Recommended Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {"".join(top_action_rows)}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <div class="section">
@@ -1081,30 +1142,34 @@ def render_html(
           <button class="filter-button" data-priority-filter="P2" type="button">P2</button>
           <button class="filter-button" data-priority-filter="P3" type="button">P3</button>
         </div>
-        <table id="tests-table">
-          <thead>
-            <tr>
-              <th>Test ID</th>
-              <th>Status</th>
-              <th>Priority</th>
-              <th>Result</th>
-              <th>Recommendation</th>
-              <th>Component</th>
-              <th>Technical details</th>
-            </tr>
-          </thead>
-          <tbody>
-            {"".join(test_rows)}
-          </tbody>
-        </table>
+        <div class="table-wrap">
+          <table id="tests-table">
+            <thead>
+              <tr>
+                <th>Test ID</th>
+                <th>Status</th>
+                <th>Priority</th>
+                <th>Result</th>
+                <th>Recommendation</th>
+                <th>Component</th>
+                <th>Technical details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {"".join(test_rows)}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <details open>
         <summary>Detailed recommendations</summary>
-        <table style="margin-top:10px;">
-          <thead><tr><th>Test ID</th><th>Finding</th><th>Recommendation</th></tr></thead>
-          <tbody>{"".join(recommendation_rows)}</tbody>
-        </table>
+        <div class="table-wrap" style="margin-top:10px;">
+          <table>
+            <thead><tr><th>Test ID</th><th>Finding</th><th>Recommendation</th></tr></thead>
+            <tbody>{"".join(recommendation_rows)}</tbody>
+          </table>
+        </div>
       </details>
 
       <details>
@@ -1114,10 +1179,12 @@ def render_html(
 
       <details>
         <summary>Skipped tests analysis</summary>
-        <table style="margin-top:10px;">
-          <thead><tr><th>Test ID</th><th>Family</th><th>Reason</th><th>Source</th></tr></thead>
-          <tbody>{"".join(skipped_rows)}</tbody>
-        </table>
+        <div class="table-wrap" style="margin-top:10px;">
+          <table>
+            <thead><tr><th>Test ID</th><th>Family</th><th>Reason</th><th>Source</th></tr></thead>
+            <tbody>{"".join(skipped_rows)}</tbody>
+          </table>
+        </div>
       </details>
 
       <details>
