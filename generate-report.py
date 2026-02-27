@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import configparser
 import grp
 import html as _html
 import math
@@ -845,11 +846,43 @@ def _parse_detail(entry: str) -> Tuple[str, str, str]:
     return tid, cmp, " | ".join(out) if out else kv_blob
 
 
-def _score_label(score: int) -> Tuple[str, str]:
-    if score >= 90: return "Excellent",  "score-ok"
-    if score >= 75: return "Good",        "score-ok"
-    if score >= 60: return "Fair",        "score-warn"
-    return "Needs Improvement",           "score-bad"
+def load_config(path: Optional[Path] = None) -> Dict[str, str]:
+    """Load report.conf and return a flat dict of values."""
+    defaults = {
+        "logo":        "",
+        "client_name": "",
+        "created_by":  "",
+        "disclaimer":  (
+            "This report is strictly confidential and intended solely for the named "
+            "client organisation. It contains sensitive security information about the "
+            "assessed system. Unauthorised disclosure or distribution to any third party "
+            "is prohibited without prior written consent."
+        ),
+    }
+    candidates = [
+        path,
+        Path("report.conf"),
+        Path(__file__).parent / "report.conf",
+    ]
+    cfg = configparser.ConfigParser(interpolation=None)
+    for p in candidates:
+        if p and p.exists():
+            cfg.read(str(p))
+            break
+    if cfg.has_option("branding", "logo"):         defaults["logo"]        = cfg.get("branding", "logo").strip()
+    if cfg.has_option("branding", "client_name"):  defaults["client_name"] = cfg.get("branding", "client_name").strip()
+    if cfg.has_option("branding", "created_by"):   defaults["created_by"]  = cfg.get("branding", "created_by").strip()
+    if cfg.has_option("footer",   "disclaimer"):   defaults["disclaimer"]  = cfg.get("footer",   "disclaimer").strip()
+    return defaults
+
+
+def _score_label(score: int) -> Tuple[str, str, str]:
+    """Return (label, css_class, grade_letter)."""
+    if score >= 90: return "Excellent",        "score-ok",   "A"
+    if score >= 80: return "Good",             "score-ok",   "B"
+    if score >= 65: return "Fair",             "score-warn", "C"
+    if score >= 50: return "Needs Improvement","score-warn", "D"
+    return "Critical",                         "score-bad",  "F"
 
 
 def _priority(status: str, summary: str, rec: str) -> str:
@@ -1021,12 +1054,21 @@ def run_lynis(report_path: Path, log_path: Path) -> None:
     print("[INFO] Lynis audit complete.")
 
 
-def build_logo_uri(logo_path: Optional[Path]) -> str:
-    if not logo_path or not logo_path.exists():
+def build_logo_uri(logo_src) -> str:
+    """Accept an http(s) URL (returned as-is) or a local PNG path (base64-encoded)."""
+    if not logo_src:
         return ""
-    if logo_path.suffix.lower() != ".png":
-        raise ValueError("Logo must be a PNG file.")
-    return "data:image/png;base64," + base64.b64encode(logo_path.read_bytes()).decode()
+    s = str(logo_src).strip()
+    if s.lower().startswith(("http://", "https://")):
+        return s
+    p = Path(s)
+    if not p.exists():
+        raise FileNotFoundError(f"Logo file not found: {p}")
+    if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp"):
+        raise ValueError(f"Unsupported logo format: {p.suffix}")
+    mime = {".jpg": "jpeg", ".jpeg": "jpeg", ".svg": "svg+xml",
+            ".gif": "gif", ".webp": "webp"}.get(p.suffix.lower(), "png")
+    return f"data:image/{mime};base64," + base64.b64encode(p.read_bytes()).decode()
 
 
 def default_paths() -> Tuple[Path, Path, Path]:
@@ -1193,8 +1235,31 @@ tr:last-child td{border-bottom:none}
 .search-input:focus{border-color:var(--primary)}
 .spacer{flex:1}
 
-/* Score ring */
+/* Score ring / card */
 .score-wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+
+.score-hero{display:flex;align-items:center;gap:24px;padding:4px 0}
+.score-hero svg{flex-shrink:0}
+.score-hero-info{display:flex;flex-direction:column;gap:6px}
+.score-grade{font-size:3.2rem;font-weight:900;line-height:1;letter-spacing:-.04em}
+.score-label-txt{font-size:1rem;font-weight:700;color:var(--text)}
+.score-meta{font-size:.8rem;color:var(--muted);margin-top:2px}
+
+.score-full-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:28px 32px;display:flex;align-items:center;gap:40px;margin-bottom:16px;
+  box-shadow:var(--shadow-md)}
+.score-full-left{display:flex;flex-direction:column;gap:14px}
+.score-full-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px 24px}
+.score-stat{display:flex;flex-direction:column;gap:2px}
+.score-stat-lbl{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+.score-stat-val{font-size:1.05rem;font-weight:700;color:var(--text)}
+
+/* Footer */
+.report-footer{margin-top:40px;padding:16px 24px;border-top:1px solid var(--border);
+  font-size:.78rem;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 20px;
+  align-items:flex-start}
+.report-footer .footer-brand{font-weight:600;color:var(--text)}
+.report-footer .footer-disclaimer{flex:1;min-width:300px;line-height:1.6}
 
 /* sshd security row highlight */
 tr.sshd-sec{background:#fffdf5}
@@ -1280,18 +1345,91 @@ _JS = """
 """
 
 
-def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
+def _make_score_ring(score: int, color: str, size: int = 140, sw: int = 13) -> str:
+    R    = size // 2 - sw
+    cx   = cy = size // 2
+    circ = 2 * math.pi * R
+    dok  = circ * score / 100
+    dg   = circ - dok
+    fs   = int(size * 0.22)
+    fs2  = int(size * 0.085)
+    return (
+        f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}">'
+        f'<circle cx="{cx}" cy="{cy}" r="{R}" fill="none" stroke="#e2e8f0" stroke-width="{sw}"/>'
+        f'<circle cx="{cx}" cy="{cy}" r="{R}" fill="none" stroke="{color}" stroke-width="{sw}"'
+        f' stroke-dasharray="{dok:.2f} {dg:.2f}" stroke-linecap="round"'
+        f' transform="rotate(-90 {cx} {cy})"/>'
+        f'<text x="{cx}" y="{cy - fs2//2}" dominant-baseline="central" text-anchor="middle"'
+        f' font-size="{fs}" font-weight="900" fill="{color}">{score}</text>'
+        f'<text x="{cx}" y="{cy + fs2 + 5}" dominant-baseline="central" text-anchor="middle"'
+        f' font-size="{fs2}" fill="#94a3b8">/100</text>'
+        f'</svg>'
+    )
+
+
+def _make_score_hero(score: int, label: str, grade: str, risk_lbl: str,
+                     risk_css: str, color: str, scan_date: str,
+                     sc: Dict[str, int], warnings_n: int, suggestions_n: int) -> str:
+    ring = _make_score_ring(score, color, size=150, sw=14)
+    return f"""<div class="score-hero">
+      {ring}
+      <div class="score-hero-info">
+        <div style="display:flex;align-items:baseline;gap:10px">
+          <span class="score-grade" style="color:{color}">{grade}</span>
+          <span class="score-label-txt">{esc(label)}</span>
+        </div>
+        {badge(f'Risk: {risk_lbl}', risk_css)}
+        <div class="score-meta">Scan: {esc(scan_date)}</div>
+      </div>
+    </div>"""
+
+
+def _make_score_full(score: int, label: str, grade: str, risk_lbl: str,
+                     risk_css: str, color: str, scan_date: str, lynis_ver: str,
+                     sc: Dict[str, int], warnings_n: int, suggestions_n: int) -> str:
+    ring = _make_score_ring(score, color, size=180, sw=15)
+    return f"""<div class="score-full-card">
+  {ring}
+  <div class="score-full-left">
+    <div style="display:flex;align-items:baseline;gap:12px">
+      <span class="score-grade" style="color:{color}">{grade}</span>
+      <div>
+        <div class="score-label-txt" style="font-size:1.3rem">{esc(label)}</div>
+        <div class="score-meta">Hardening score: {score}/100 &mdash; {badge(f'Risk: {risk_lbl}', risk_css)}</div>
+      </div>
+    </div>
+    <div class="score-full-stats">
+      <div class="score-stat"><span class="score-stat-lbl">Tests passed</span><span class="score-stat-val text-ok">{sc.get('passed',0)}</span></div>
+      <div class="score-stat"><span class="score-stat-lbl">Warnings</span><span class="score-stat-val {'text-danger' if warnings_n else 'text-ok'}">{warnings_n}</span></div>
+      <div class="score-stat"><span class="score-stat-lbl">Suggestions</span><span class="score-stat-val {'text-warn' if suggestions_n else 'text-ok'}">{suggestions_n}</span></div>
+      <div class="score-stat"><span class="score-stat-lbl">Skipped</span><span class="score-stat-val muted">{sc.get('skipped',0)}</span></div>
+      <div class="score-stat"><span class="score-stat-lbl">Lynis version</span><span class="score-stat-val mono">{esc(lynis_ver)}</span></div>
+      <div class="score-stat"><span class="score-stat-lbl">Scan date</span><span class="score-stat-val">{esc(scan_date)}</span></div>
+    </div>
+  </div>
+</div>"""
+
+
+def render_html(sys_data, lynis, lynis_path, log_path, logo_uri, cfg: Optional[Dict[str, str]] = None):
+    cfg = cfg or {}
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logo_html = f"<img src='{logo_uri}' alt='Logo' class='logo'/>" if logo_uri else ""
+
+    # Branding from config
+    client_name = cfg.get("client_name", "")
+    created_by  = cfg.get("created_by", "")
+    disclaimer  = cfg.get("disclaimer", "")
+    logo_html   = f"<img src='{logo_uri}' alt='Logo' class='logo'/>" if logo_uri else ""
+
     lv = lynis.values; la = lynis.arrays
     score     = int(lv.get("hardening_index", "0") or 0)
-    score_lbl, _ = _score_label(score)
+    score_lbl, _, grade = _score_label(score)
     risk_lbl  = "High" if score < 60 else "Medium" if score < 80 else "Controlled"
     risk_css  = "danger" if score < 60 else "warn" if score < 80 else "ok"
     score_col = "#dc2626" if score < 60 else "#d97706" if score < 80 else "#059669"
     lynis_ver = lv.get("lynis_version", "—")
     scan_start= lv.get("report_datetime_start", "—")
     scan_end  = lv.get("report_datetime_end", "—")
+    scan_date = scan_start[:10] if len(scan_start) >= 10 else scan_start
     tests_done= int(lv.get("lynis_tests_done", "0") or 0)
     warnings  = la.get("warning", [])
     suggestions=la.get("suggestion", [])
@@ -1299,19 +1437,17 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
     skip_map  = parse_skip_reasons_from_log(log_path)
     test_rows, sc, pc, actions, skipped_rows = build_test_rows(lynis, skip_map)
     total_chk = max(1, sum(sc.values()))
-    R = 52; cx = cy = 64; circ = 2 * math.pi * R
-    dash_ok  = circ * score / 100; dash_gap = circ - dash_ok
-    score_svg = (
-        f'<svg viewBox="0 0 128 128" width="110" height="110" style="display:block;margin:0 auto">'
-        f'<circle cx="{cx}" cy="{cy}" r="{R}" fill="none" stroke="#e2e8f0" stroke-width="12"/>'
-        f'<circle cx="{cx}" cy="{cy}" r="{R}" fill="none" stroke="{score_col}" stroke-width="12"'
-        f' stroke-dasharray="{dash_ok:.2f} {dash_gap:.2f}"'
-        f' stroke-linecap="round" transform="rotate(-90 {cx} {cy})"/>'
-        f'<text x="{cx}" y="{cy}" dominant-baseline="central" text-anchor="middle"'
-        f' font-size="24" font-weight="800" fill="{score_col}">{score}</text>'
-        f'<text x="{cx}" y="{cy+22}" dominant-baseline="central" text-anchor="middle"'
-        f' font-size="10" fill="#94a3b8">/100</text></svg>'
-    )
+
+    # Compact score ring (Machine tab overview card)
+    score_ring_sm = _make_score_ring(score, score_col, size=120, sw=12)
+    # Hero score for Machine tab card
+    score_hero_html = _make_score_hero(score, score_lbl, grade, risk_lbl,
+                                        risk_css, score_col, scan_date, sc,
+                                        len(warnings), len(suggestions))
+    # Full score card for Lynis tab
+    score_full_html = _make_score_full(score, score_lbl, grade, risk_lbl,
+                                        risk_css, score_col, scan_date, lynis_ver,
+                                        sc, len(warnings), len(suggestions))
     sys  = sys_data.get("system", {})
     hostname = sys.get("hostname", lv.get("hostname", "Unknown"))
     os_name  = sys.get("os_name",  lv.get("os_fullname", lv.get("os_name", "Unknown")))
@@ -1574,20 +1710,22 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 <style>{_CSS}</style></head><body><div class="page">
 <header class="header">
   <div class="header-brand">{logo_html}
-    <div><h1>Security Hardening Report</h1>
+    <div>
+      <h1>Security Hardening Report{(' &mdash; ' + esc(client_name)) if client_name else ''}</h1>
       <div class="header-meta">
         <span>{icon('server',14)} <b>Host:</b> {esc(hostname)}</span>
         <span>{icon('cpu',14)} <b>OS:</b> {esc(os_name)}</span>
         <span>{icon('settings',14)} <b>Kernel:</b> {esc(kernel)} {esc(arch)}</span>
         <span>{icon('calendar',14)} <b>Generated:</b> {esc(generated_at)}</span>
         <span>{icon('shield',14)} <b>Lynis:</b> {esc(lynis_ver)}</span>
+        {(f"<span>{icon('users',14)} <b>Created by:</b> {esc(created_by)}</span>") if created_by else ""}
       </div>
     </div>
   </div>
 </header>""")
     _h.append(f"""
 <div class="kpi-strip">
-  <div class="kpi"><div class="kpi-label">Hardening Score</div><div class="kpi-value {risk_css}">{score}<span style="font-size:1rem;font-weight:500">/100</span></div><div class="kpi-sub">{esc(score_lbl)}</div></div>
+  <div class="kpi"><div class="kpi-label">Hardening Score</div><div class="kpi-value {risk_css}">{score}<span style="font-size:1rem;font-weight:500">/100</span></div><div class="kpi-sub">Grade: <strong>{grade}</strong> &mdash; {esc(score_lbl)}</div></div>
   <div class="kpi"><div class="kpi-label">Risk Level</div><div class="kpi-value {risk_css}">{esc(risk_lbl)}</div><div class="kpi-sub">Based on Lynis</div></div>
   <div class="kpi"><div class="kpi-label">Warnings</div><div class="kpi-value {'danger' if warnings else 'ok'}">{len(warnings)}</div><div class="kpi-sub">Critical findings</div></div>
   <div class="kpi"><div class="kpi-label">Suggestions</div><div class="kpi-value {'warn' if suggestions else 'ok'}">{len(suggestions)}</div><div class="kpi-sub">Improvement items</div></div>
@@ -1636,9 +1774,9 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
       <div class="kv-row"><span class="kv-key">Package Manager</span><span class="kv-val">{esc(sys.get('pkg_mgr','—'))}</span></div>
     </div>
   </div>
-  <div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px">
-    <div class="card-title" style="width:100%">{icon('shield',13)} Hardening Score</div>
-    <div class="score-wrap">{score_svg}{badge(f'Risk: {risk_lbl}', risk_css)}<div class="muted small" style="text-align:center">{esc(score_lbl)} &mdash; {esc(scan_start[:10] if len(scan_start)>=10 else scan_start)}</div></div>
+  <div class="card">
+    <div class="card-title">{icon('shield',13)} Hardening Score</div>
+    {score_hero_html}
   </div>
 </div>""")
     _h.append(f"""
@@ -1816,8 +1954,10 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 </div>""")
     _h.append(f"""
 <div id="panel-lynis" class="panel">
+
+{score_full_html}
+
 <div class="card-grid" style="margin-bottom:14px">
-  <div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center"><div class="card-title" style="width:100%">{icon('shield',13)} Hardening Score</div><div class="score-wrap">{score_svg}{badge(f'Risk: {risk_lbl}',risk_css)}</div></div>
   <div class="card"><div class="card-title">{icon('check',13)} Test Results</div><div class="kv-list">
     <div class="kv-row"><span class="kv-key">Passed</span><span class="kv-val text-ok">{sc.get('passed',0)}</span></div>
     <div class="kv-row"><span class="kv-key">Suggestions</span><span class="kv-val text-warn">{sc.get('suggestion',0)}</span></div>
@@ -1870,7 +2010,19 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 <div class="det-body" style="padding:0"><div class="tbl-wrap scrollable"><table><thead><tr><th style="width:110px">Test ID</th><th style="width:80px">Family</th><th>Reason</th></tr></thead>
 <tbody>{"".join(skipped_rows)}</tbody></table></div></div></details>
 </div>
-</div><script>{_JS}</script></body></html>""")
+</div>
+
+<footer class="report-footer">
+  <div>
+    <span class="footer-brand">{icon('shield',13)} Security Hardening Report</span>
+    {(f'&mdash; <strong>{esc(client_name)}</strong>') if client_name else ''}
+    &nbsp;&middot;&nbsp; Generated {esc(generated_at)}
+    {(f'&nbsp;&middot;&nbsp; {esc(created_by)}') if created_by else ''}
+  </div>
+  {(f'<div class="footer-disclaimer">{icon("alert",12)} {esc(disclaimer)}</div>') if disclaimer else ''}
+</footer>
+
+<script>{_JS}</script></body></html>""")
     return "".join(_h)
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -1882,13 +2034,15 @@ def main() -> int:
     parser.add_argument("--output",      "-o", type=Path, default=None,
                         help="Output HTML path (default: results/report_<host>_<date>.html)")
     parser.add_argument("--logo",        type=Path, default=None,
-                        help="Path to a PNG logo to embed in the report")
+                        help="Path to a PNG logo to embed in the report (overrides report.conf)")
     parser.add_argument("--report",      "-r", type=Path, default=None,
                         help="Existing Lynis .dat report file (skips Lynis run)")
     parser.add_argument("--log-file",    type=Path, default=None,
                         help="Existing Lynis log file for richer skip reasons")
     parser.add_argument("--report-only", action="store_true",
                         help="Only generate the HTML from an existing report, no scans")
+    parser.add_argument("--config",      "-c", type=Path, default=None,
+                        help="Path to report.conf config file (default: ./report.conf)")
     args = parser.parse_args()
 
     default_report, default_log, default_html = default_paths()
@@ -1918,11 +2072,15 @@ def main() -> int:
 
     sys_data = collect_all()
 
+    cfg = load_config(args.config)
     lynis = parse_lynis_report(lynis_report_path)
+
+    # --logo arg overrides report.conf logo
     logo_uri = ""
-    if args.logo:
+    logo_src = str(args.logo) if args.logo else cfg.get("logo", "").strip()
+    if logo_src:
         try:
-            logo_uri = build_logo_uri(args.logo)
+            logo_uri = build_logo_uri(logo_src)
         except Exception as e:
             print(f"[WARN] Could not load logo: {e}", file=sys.stderr)
 
@@ -1933,6 +2091,7 @@ def main() -> int:
         lynis_path=lynis_report_path,
         log_path=lynis_log_path if lynis_log_path.exists() else None,
         logo_uri=logo_uri,
+        cfg=cfg,
     )
     output_path.write_text(html, encoding="utf-8")
     print(f"[DONE] Report saved to: {output_path}")
