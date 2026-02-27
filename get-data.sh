@@ -239,12 +239,69 @@ PY
       print "service_enablement[]=" $1 "|" $2
     }'
 
+    # Extended security sysctl coverage
     for key in \
       kernel.kptr_restrict kernel.modules_disabled kernel.sysrq kernel.unprivileged_bpf_disabled \
-      net.core.bpf_jit_harden net.ipv4.conf.all.log_martians net.ipv4.conf.default.log_martians \
-      fs.protected_fifos fs.protected_regular fs.protected_symlinks fs.suid_dumpable ; do
+      kernel.randomize_va_space kernel.dmesg_restrict kernel.perf_event_paranoid \
+      kernel.yama.ptrace_scope kernel.core_uses_pid kernel.core_pattern \
+      net.core.bpf_jit_harden \
+      net.ipv4.conf.all.log_martians net.ipv4.conf.default.log_martians \
+      net.ipv4.conf.all.accept_redirects net.ipv4.conf.default.accept_redirects \
+      net.ipv4.conf.all.send_redirects net.ipv4.conf.default.send_redirects \
+      net.ipv4.conf.all.accept_source_route net.ipv4.conf.default.accept_source_route \
+      net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter \
+      net.ipv4.ip_forward net.ipv4.tcp_syncookies \
+      net.ipv4.icmp_echo_ignore_broadcasts net.ipv4.icmp_ignore_bogus_error_responses \
+      net.ipv6.conf.all.accept_redirects net.ipv6.conf.all.disable_ipv6 \
+      net.ipv6.conf.all.accept_ra \
+      fs.protected_fifos fs.protected_regular fs.protected_symlinks fs.protected_hardlinks \
+      fs.suid_dumpable ; do
       echo "security_sysctl[]=${key}=$(sysctl -n "${key}" 2>/dev/null || echo unavailable)"
     done
+
+    # AppArmor / SELinux (MAC)
+    if command -v aa-status >/dev/null 2>&1; then
+      echo "mac_type=AppArmor"
+      aa-status 2>/dev/null | head -20 | awk '{print "mac_status_line[]="$0}' || true
+    elif command -v getenforce >/dev/null 2>&1; then
+      echo "mac_type=SELinux"
+      getenforce 2>/dev/null | awk '{print "mac_status_line[]="$0}' || true
+      sestatus 2>/dev/null | awk '{print "mac_status_line[]="$0}' || true
+    else
+      echo "mac_type=none"
+    fi
+
+    # NTP / time sync
+    if command -v timedatectl >/dev/null 2>&1; then
+      echo "ntp_tool=timedatectl"
+      timedatectl status 2>/dev/null | awk '{print "ntp_status[]="$0}' || true
+    elif command -v chronyc >/dev/null 2>&1; then
+      echo "ntp_tool=chronyc"
+      chronyc tracking 2>/dev/null | awk '{print "ntp_status[]="$0}' || true
+    elif command -v ntpq >/dev/null 2>&1; then
+      echo "ntp_tool=ntpq"
+      ntpq -p 2>/dev/null | awk '{print "ntp_status[]="$0}' || true
+    else
+      echo "ntp_tool=none"
+    fi
+
+    # Users with UID 0 (privilege escalation risk)
+    awk -F: '$3 == 0 {print "uid0_user[]="$1}' /etc/passwd 2>/dev/null || true
+
+    # Login history (last 30 events)
+    last -n 30 -F 2>/dev/null | awk 'NF>0 && !/^$/ {print "login_history[]="$0}' || true
+
+    # Cron jobs — system-level
+    for cron_file in /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/*; do
+      [[ -f "${cron_file}" ]] || continue
+      while IFS= read -r line; do
+        [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        echo "cron_job[]=${cron_file}|${line}"
+      done < "${cron_file}" 2>/dev/null || true
+    done
+    # Systemd timers
+    systemctl list-timers --all --no-pager --no-legend 2>/dev/null | awk 'NF>0 {print "systemd_timer[]="$0}' || true
 
     if command -v sshd >/dev/null 2>&1; then
       sshd -T 2>/dev/null | awk '{print "sshd_effective[]="$0}'
@@ -294,9 +351,33 @@ PY
     esac
   } > "${SYSTEM_SNAPSHOT_FILE}"
 
-  # Enrich with sudoers checks when possible.
+  # Enrich with root-only data.
   if [[ -n "${as_root}" ]]; then
+    # Locked users from shadow
     ${as_root} sh -c "awk -F: '(\$2 ~ /^!|^\\*$/) {print \"locked_user[]=\"\$1}' /etc/shadow 2>/dev/null" >> "${SYSTEM_SNAPSHOT_FILE}" || true
+
+    # Failed login attempts (lastb)
+    ${as_root} lastb -n 30 -F 2>/dev/null | awk 'NF>0 && !/^$/ && !/^btmp/ {print "failed_login[]="$0}' >> "${SYSTEM_SNAPSHOT_FILE}" || true
+
+    # Audit rules (auditd)
+    if command -v auditctl >/dev/null 2>&1; then
+      ${as_root} auditctl -l 2>/dev/null | awk '{print "audit_rule[]="$0}' >> "${SYSTEM_SNAPSHOT_FILE}" || true
+    fi
+
+    # Password aging for every user (chage -l)
+    while IFS=: read -r username _rest; do
+      chage_out="$(${as_root} chage -l "${username}" 2>/dev/null | tr '\n' '|' | sed 's/|*$//')"
+      [[ -n "${chage_out}" ]] && echo "password_aging[]=${username}|${chage_out}" >> "${SYSTEM_SNAPSHOT_FILE}" || true
+    done < /etc/passwd
+
+    # User crontabs
+    while IFS=: read -r username _rest; do
+      cron_lines="$(${as_root} crontab -l -u "${username}" 2>/dev/null | grep -v '^#' | grep -v '^[[:space:]]*$')"
+      if [[ -n "${cron_lines}" ]]; then
+        echo "${cron_lines}" | awk -v u="${username}" '{print "cron_user[]=" u "|" $0}' >> "${SYSTEM_SNAPSHOT_FILE}" || true
+      fi
+    done < /etc/passwd
+
     ${as_root} python3 - <<'PY' >> "${SYSTEM_SNAPSHOT_FILE}" || true
 import grp
 import pwd
