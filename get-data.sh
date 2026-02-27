@@ -10,9 +10,6 @@ HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname || echo "unknown-host")"
 REPORT_FILE="${REPORTS_DIR}/report_${HOSTNAME_SHORT}_${DATE_STAMP}.dat"
 LOG_FILE="${RESULTS_DIR}/lynis_${HOSTNAME_SHORT}_${DATE_STAMP}.log"
 SYSTEM_SNAPSHOT_FILE="${REPORTS_DIR}/system_${HOSTNAME_SHORT}_${DATE_STAMP}.dat"
-OPENSCAP_SNAPSHOT_FILE="${REPORTS_DIR}/openscap_${HOSTNAME_SHORT}_${DATE_STAMP}.dat"
-OPENSCAP_RESULT_XML="${RESULTS_DIR}/openscap_${HOSTNAME_SHORT}_${DATE_STAMP}.xml"
-OPENSCAP_REPORT_HTML="${RESULTS_DIR}/openscap_${HOSTNAME_SHORT}_${DATE_STAMP}.html"
 
 require_sudo() {
   if command -v sudo >/dev/null 2>&1; then
@@ -77,40 +74,6 @@ install_lynis() {
   fi
 }
 
-install_openscap() {
-  if command -v oscap >/dev/null 2>&1; then
-    echo "[INFO] OpenSCAP is already installed."
-    return
-  fi
-
-  local as_root
-  as_root="$(require_sudo)"
-  echo "[INFO] OpenSCAP not found. Attempting installation..."
-
-  if command -v apt-get >/dev/null 2>&1; then
-    ${as_root} apt-get update
-    ${as_root} apt-get install -y openscap-scanner ssg-debderived || ${as_root} apt-get install -y openscap-scanner
-  elif command -v dnf >/dev/null 2>&1; then
-    ${as_root} dnf install -y openscap-scanner scap-security-guide
-  elif command -v yum >/dev/null 2>&1; then
-    ${as_root} yum install -y openscap-scanner scap-security-guide
-  elif command -v zypper >/dev/null 2>&1; then
-    ${as_root} zypper --non-interactive install openscap-utils scap-security-guide
-  elif command -v pacman >/dev/null 2>&1; then
-    ${as_root} pacman -Sy --noconfirm openscap
-  elif command -v apk >/dev/null 2>&1; then
-    ${as_root} apk add --no-cache openscap-scanner
-  else
-    echo "[ERROR] Unsupported Linux distribution: no known package manager found."
-    echo "[ERROR] Please install OpenSCAP manually and run this script again."
-    exit 1
-  fi
-
-  if ! command -v oscap >/dev/null 2>&1; then
-    echo "[ERROR] OpenSCAP installation failed."
-    exit 1
-  fi
-}
 
 run_audit() {
   local as_root
@@ -131,115 +94,6 @@ run_audit() {
   echo "[INFO] Generated report: ${REPORT_FILE}"
 }
 
-find_openscap_datastream() {
-  local candidates=(
-    "/usr/share/xml/scap/ssg/content/ssg-debian13-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-debian12-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-debian11-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-debian10-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-debian-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-ubuntu2404-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-ubuntu2204-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-ubuntu2004-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-ubuntu-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml"
-    "/usr/share/xml/scap/ssg/content/ssg-centos8-ds.xml"
-  )
-  local path
-  for path in "${candidates[@]}"; do
-    if [[ -f "${path}" ]]; then
-      echo "${path}"
-      return 0
-    fi
-  done
-
-  for path in /usr/share/xml/scap/ssg/content/ssg-*-ds.xml /usr/local/share/xml/scap/ssg/content/ssg-*-ds.xml; do
-    if [[ -f "${path}" ]]; then
-      echo "${path}"
-      return 0
-    fi
-  done
-  return 1
-}
-
-run_openscap_scan() {
-  local as_root
-  as_root="$(require_sudo)"
-
-  mkdir -p "${REPORTS_DIR}" "${RESULTS_DIR}"
-  local datastream
-  datastream="$(find_openscap_datastream || true)"
-  if [[ -z "${datastream}" ]]; then
-    echo "[WARN] OpenSCAP datastream not found. Skipping OpenSCAP scan."
-    {
-      echo "# OpenSCAP snapshot"
-      echo "openscap_datetime=$(date '+%Y-%m-%d %H:%M:%S')"
-      echo "openscap_status=datastream_not_found"
-      echo "openscap_profile=N/A"
-      echo "openscap_datastream=N/A"
-      echo "openscap_total_rules=0"
-      echo "openscap_passed_rules=0"
-      echo "openscap_failed_rules=0"
-      echo "openscap_error_rules=0"
-      echo "openscap_notchecked_rules=0"
-    } > "${OPENSCAP_SNAPSHOT_FILE}"
-    return
-  fi
-
-  local profile="xccdf_org.ssgproject.content_profile_standard"
-  echo "[INFO] Running OpenSCAP scan..."
-  echo "[INFO] Datastream: ${datastream}"
-  echo "[INFO] OpenSCAP results XML: ${OPENSCAP_RESULT_XML}"
-  echo "[INFO] OpenSCAP HTML report: ${OPENSCAP_REPORT_HTML}"
-
-  ${as_root} oscap xccdf eval \
-    --profile "${profile}" \
-    --results "${OPENSCAP_RESULT_XML}" \
-    --report "${OPENSCAP_REPORT_HTML}" \
-    "${datastream}" || true
-
-  local pass_count fail_count error_count notchecked_count notselected_count total_count
-  pass_count="$(rg -N -c "<result>pass</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
-  fail_count="$(rg -N -c "<result>fail</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
-  error_count="$(rg -N -c "<result>error</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
-  notchecked_count="$(rg -N -c "<result>notchecked</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
-  notselected_count="$(rg -N -c "<result>notselected</result>" "${OPENSCAP_RESULT_XML}" 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')"
-  total_count=$((pass_count + fail_count + error_count + notchecked_count + notselected_count))
-
-  {
-    echo "# OpenSCAP snapshot"
-    echo "openscap_datetime=$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "openscap_status=completed"
-    echo "openscap_profile=${profile}"
-    echo "openscap_datastream=${datastream}"
-    echo "openscap_total_rules=${total_count}"
-    echo "openscap_passed_rules=${pass_count}"
-    echo "openscap_failed_rules=${fail_count}"
-    echo "openscap_error_rules=${error_count}"
-    echo "openscap_notchecked_rules=$((notchecked_count + notselected_count))"
-
-    if [[ -f "${OPENSCAP_RESULT_XML}" ]]; then
-      python3 - <<'PY' "${OPENSCAP_RESULT_XML}"
-import re
-import sys
-from pathlib import Path
-
-content = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-rule_re = re.compile(r'<rule-result[^>]*idref="([^"]+)"[^>]*>.*?<result>([^<]+)</result>', re.DOTALL)
-count = 0
-for rid, status in rule_re.findall(content):
-    if status.strip().lower() == "fail":
-        print(f"openscap_failed_rule[]={rid}")
-        count += 1
-    if count >= 200:
-        break
-PY
-    fi
-  } > "${OPENSCAP_SNAPSHOT_FILE}"
-
-  echo "[INFO] OpenSCAP scan completed."
-}
 
 collect_system_snapshot() {
   local as_root
@@ -322,9 +176,66 @@ collect_system_snapshot() {
       fi
     done
 
+    python3 - <<'PY'
+from pathlib import Path
+import os
+import pwd
+import grp
+
+FILES = [
+    "/etc/motd",
+    "/etc/issue",
+    "/etc/issue.net",
+    "/etc/ssh/sshd_config",
+    "/etc/login.defs",
+    "/etc/pam.d/common-password",
+    "/etc/pam.d/sshd",
+    "/etc/sudoers",
+    "/etc/security/limits.conf",
+    "/etc/audit/auditd.conf",
+    "/etc/rsyslog.conf",
+    "/etc/sysctl.conf",
+]
+
+MAX_PREVIEW = 1600
+
+def one_line(value: str) -> str:
+    return " ".join(value.replace("\r", "\n").splitlines())
+
+for file_path in FILES:
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        print(f"important_file[]={file_path}|present=no")
+        continue
+    try:
+        st = path.stat()
+        owner = pwd.getpwuid(st.st_uid).pw_name
+        group = grp.getgrgid(st.st_gid).gr_name
+        mode = oct(st.st_mode & 0o777).replace("0o", "")
+        content = path.read_text(encoding="utf-8", errors="replace")
+        preview = one_line(content[:MAX_PREVIEW])
+        if len(content) > MAX_PREVIEW:
+            preview += " ...[truncated]"
+        print(
+            "important_file[]="
+            + f"{file_path}|present=yes|mode={mode}|owner={owner}|group={group}|size={st.st_size}|preview={preview}"
+        )
+    except Exception as exc:
+        print(f"important_file[]={file_path}|present=error|error={str(exc)}")
+PY
+
     findmnt -rn -o TARGET,FSTYPE,OPTIONS 2>/dev/null | awk '{print "mount_info[]="$0}'
     ss -tulpen 2>/dev/null | awk 'NR>1 {print "open_port[]="$0}'
     systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print "running_service_full[]="$1}'
+    systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null | awk '{
+      unit=$1; load=$2; active=$3; sub=$4;
+      $1=""; $2=""; $3=""; $4="";
+      desc=$0; gsub(/^[ \t]+/, "", desc);
+      print "service_status[]=" unit "|" load "|" active "|" sub "|" desc
+    }'
+    systemctl list-unit-files --type=service --no-pager --no-legend 2>/dev/null | awk '{
+      print "service_enablement[]=" $1 "|" $2
+    }'
 
     for key in \
       kernel.kptr_restrict kernel.modules_disabled kernel.sysrq kernel.unprivileged_bpf_disabled \
@@ -384,6 +295,159 @@ collect_system_snapshot() {
   # Enrich with sudoers checks when possible.
   if [[ -n "${as_root}" ]]; then
     ${as_root} sh -c "awk -F: '(\$2 ~ /^!|^\\*$/) {print \"locked_user[]=\"\$1}' /etc/shadow 2>/dev/null" >> "${SYSTEM_SNAPSHOT_FILE}" || true
+    ${as_root} python3 - <<'PY' >> "${SYSTEM_SNAPSHOT_FILE}" || true
+import grp
+import pwd
+import subprocess
+from pathlib import Path
+
+
+def parse_sshd_effective():
+    data = {}
+    try:
+        out = subprocess.run(["sshd", "-T"], capture_output=True, text=True, check=False).stdout
+    except Exception:
+        return data
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line or " " not in line:
+            continue
+        key, value = line.split(" ", 1)
+        data[key.lower()] = value.strip()
+    return data
+
+
+def split_list(value: str):
+    if not value:
+        return set()
+    return {item.strip() for item in value.split() if item.strip()}
+
+
+def user_groups(username: str):
+    out = set()
+    try:
+        primary_gid = pwd.getpwnam(username).pw_gid
+        out.add(grp.getgrgid(primary_gid).gr_name)
+    except Exception:
+        pass
+    for g in grp.getgrall():
+        if username in g.gr_mem:
+            out.add(g.gr_name)
+    return out
+
+
+def read_shadow_lock_state():
+    state = {}
+    shadow = Path("/etc/shadow")
+    if not shadow.exists():
+        return state
+    for raw in shadow.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = raw.split(":")
+        if len(parts) < 2:
+            continue
+        user, hash_value = parts[0], parts[1]
+        if hash_value in ("", "!", "*", "!!") or hash_value.startswith("!"):
+            state[user] = "locked"
+        else:
+            state[user] = "set"
+    return state
+
+
+def is_shell_login_allowed(shell_path: str):
+    blocked = {
+        "/usr/sbin/nologin",
+        "/sbin/nologin",
+        "/bin/false",
+        "/usr/bin/false",
+        "nologin",
+        "false",
+    }
+    return shell_path not in blocked
+
+
+def read_authorized_keys(home_dir: str):
+    key_files = [
+        Path(home_dir) / ".ssh" / "authorized_keys",
+        Path(home_dir) / ".ssh" / "authorized_keys2",
+    ]
+    key_summaries = []
+    count = 0
+    for key_file in key_files:
+        if not key_file.exists() or not key_file.is_file():
+            continue
+        try:
+            lines = key_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            cleaned = line.strip()
+            if not cleaned or cleaned.startswith("#"):
+                continue
+            count += 1
+            parts = cleaned.split()
+            key_type = parts[0] if len(parts) > 0 else "unknown"
+            key_comment = parts[2] if len(parts) > 2 else ""
+            short = f"{key_type}:{key_comment}" if key_comment else key_type
+            key_summaries.append(short)
+            if len(key_summaries) >= 5:
+                break
+        if len(key_summaries) >= 5:
+            break
+    return count, ", ".join(key_summaries) if key_summaries else "none"
+
+
+sshd = parse_sshd_effective()
+allow_users = split_list(sshd.get("allowusers", ""))
+deny_users = split_list(sshd.get("denyusers", ""))
+allow_groups = split_list(sshd.get("allowgroups", ""))
+deny_groups = split_list(sshd.get("denygroups", ""))
+permit_root_login = sshd.get("permitrootlogin", "prohibit-password").lower()
+pubkey_auth = sshd.get("pubkeyauthentication", "yes").lower() == "yes"
+password_auth = sshd.get("passwordauthentication", "yes").lower() == "yes"
+kbd_auth = sshd.get("kbdinteractiveauthentication", "no").lower() == "yes"
+shadow_state = read_shadow_lock_state()
+
+for pw in pwd.getpwall():
+    if pw.pw_uid < 1000 and pw.pw_uid != 0:
+        continue
+    username = pw.pw_name
+    shell = pw.pw_shell or "unknown"
+    groups = user_groups(username)
+    shell_allowed = is_shell_login_allowed(shell)
+    passwd_state = shadow_state.get(username, "unknown")
+
+    denied_by_user = username in deny_users
+    denied_by_group = bool(deny_groups.intersection(groups))
+    allowed_by_user = (not allow_users) or (username in allow_users)
+    allowed_by_group = (not allow_groups) or bool(allow_groups.intersection(groups))
+    ssh_access = shell_allowed and allowed_by_user and allowed_by_group and not denied_by_user and not denied_by_group
+
+    methods = []
+    key_count, key_preview = read_authorized_keys(pw.pw_dir)
+    if ssh_access and pubkey_auth and key_count > 0:
+        methods.append("ssh-publickey")
+    if ssh_access and password_auth and passwd_state == "set":
+        if username != "root" or permit_root_login == "yes":
+            methods.append("ssh-password")
+    if ssh_access and kbd_auth and passwd_state == "set":
+        if username != "root" or permit_root_login == "yes":
+            methods.append("ssh-keyboard-interactive")
+    if shell_allowed and passwd_state == "set":
+        methods.append("local-shell")
+
+    if username == "root" and permit_root_login == "no":
+        ssh_access = False
+        methods = [m for m in methods if not m.startswith("ssh-")]
+
+    groups_text = ",".join(sorted(groups)) if groups else "none"
+    methods_text = ",".join(methods) if methods else "none"
+    ssh_status = "yes" if ssh_access else "no"
+    print(
+        "user_auth[]="
+        + f"{username}|uid={pw.pw_uid}|shell={shell}|password={passwd_state}|ssh_allowed={ssh_status}"
+        + f"|methods={methods_text}|groups={groups_text}|authorized_keys={key_count}|key_preview={key_preview}"
+    )
+PY
   fi
 
   echo "[INFO] Additional system snapshot collected."
@@ -402,10 +466,8 @@ main() {
   fi
 
   install_lynis
-  install_openscap
   run_audit
   collect_system_snapshot
-  run_openscap_scan
 }
 
 main "$@"

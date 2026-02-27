@@ -13,7 +13,6 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
-from xml.etree import ElementTree as ET
 
 
 class ParsedReport:
@@ -139,13 +138,6 @@ def default_log_path(report_path: Path) -> Path:
     return report_path.with_suffix(".log")
 
 
-def default_openscap_data_path(report_path: Path) -> Path:
-    filename = report_path.name
-    if filename.startswith("report_") and filename.endswith(".dat"):
-        return report_path.with_name("openscap_" + filename[len("report_"):])
-    return report_path.with_name("openscap_snapshot.dat")
-
-
 def detect_package_manager() -> str:
     if shutil.which("apt-get"):
         return "apt"
@@ -196,109 +188,12 @@ def ensure_lynis_installed() -> None:
         raise RuntimeError("Lynis installation failed.")
 
 
-def ensure_openscap_installed() -> None:
-    if shutil.which("oscap"):
-        return
-    manager = detect_package_manager()
-    candidates = {
-        "apt": ["openscap-scanner", "ssg-debderived"],
-        "dnf": ["openscap-scanner", "scap-security-guide"],
-        "yum": ["openscap-scanner", "scap-security-guide"],
-        "zypper": ["openscap-utils", "scap-security-guide"],
-        "pacman": ["openscap"],
-        "apk": ["openscap-scanner"],
-    }
-    for pkg in candidates.get(manager, ["openscap-scanner"]):
-        try:
-            install_package(pkg)
-        except Exception:
-            continue
-        if shutil.which("oscap"):
-            return
-    if not shutil.which("oscap"):
-        raise RuntimeError("OpenSCAP installation failed.")
-
-
-def find_openscap_datastream() -> Path | None:
-    candidates = [
-        "/usr/share/xml/scap/ssg/content/ssg-debian13-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-debian12-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-debian11-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-debian10-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-debian-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-ubuntu2404-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-ubuntu2204-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-ubuntu2004-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-ubuntu-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml",
-        "/usr/share/xml/scap/ssg/content/ssg-centos8-ds.xml",
-    ]
-    for candidate in candidates:
-        path = Path(candidate)
-        if path.exists():
-            return path
-    for directory in (
-        Path("/usr/share/xml/scap/ssg/content"),
-        Path("/usr/local/share/xml/scap/ssg/content"),
-    ):
-        if not directory.exists():
-            continue
-        for path in sorted(directory.glob("ssg-*-ds.xml")):
-            return path
-    return None
-
-
-def parse_openscap_results(results_xml: Path) -> Dict[str, str]:
-    summary = {
-        "openscap_total_rules": "0",
-        "openscap_passed_rules": "0",
-        "openscap_failed_rules": "0",
-        "openscap_error_rules": "0",
-        "openscap_notchecked_rules": "0",
-    }
-    if not results_xml.exists():
-        return summary
-
-    try:
-        tree = ET.parse(results_xml)
-    except ET.ParseError:
-        return summary
-    root = tree.getroot()
-    counts = {"pass": 0, "fail": 0, "error": 0, "notchecked": 0, "notselected": 0, "informational": 0}
-    for elem in root.iter():
-        tag = elem.tag.split("}", 1)[-1]
-        if tag != "rule-result":
-            continue
-        result_node = None
-        for child in elem:
-            child_tag = child.tag.split("}", 1)[-1]
-            if child_tag == "result":
-                result_node = child
-                break
-        if result_node is None or not result_node.text:
-            continue
-        key = result_node.text.strip().lower()
-        if key in counts:
-            counts[key] += 1
-
-    total = sum(counts.values())
-    summary["openscap_total_rules"] = str(total)
-    summary["openscap_passed_rules"] = str(counts["pass"])
-    summary["openscap_failed_rules"] = str(counts["fail"])
-    summary["openscap_error_rules"] = str(counts["error"])
-    summary["openscap_notchecked_rules"] = str(counts["notchecked"] + counts["notselected"])
-    return summary
-
-
-def run_full_collection(report_path: Path, log_path: Path, system_data_path: Path, openscap_data_path: Path) -> None:
+def run_full_collection(report_path: Path, log_path: Path, system_data_path: Path) -> None:
     ensure_lynis_installed()
-    ensure_openscap_installed()
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     system_data_path.parent.mkdir(parents=True, exist_ok=True)
-    openscap_data_path.parent.mkdir(parents=True, exist_ok=True)
 
     run_cmd(
         [
@@ -319,78 +214,6 @@ def run_full_collection(report_path: Path, log_path: Path, system_data_path: Pat
     default_snapshot = default_system_data_path(report_path)
     if default_snapshot.exists() and default_snapshot != system_data_path:
         system_data_path.write_text(default_snapshot.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-
-    datastream = find_openscap_datastream()
-    openscap_html = openscap_data_path.with_suffix(".html")
-    openscap_xml = openscap_data_path.with_suffix(".xml")
-
-    openscap_meta = {
-        "openscap_status": "not_run",
-        "openscap_profile": "N/A",
-        "openscap_datastream": "N/A",
-    }
-
-    if datastream is not None:
-        profile = "xccdf_org.ssgproject.content_profile_standard"
-        try:
-            run_cmd(
-                [
-                    "oscap",
-                    "xccdf",
-                    "eval",
-                    "--profile",
-                    profile,
-                    "--results",
-                    str(openscap_xml),
-                    "--report",
-                    str(openscap_html),
-                    str(datastream),
-                ],
-                use_sudo=True,
-                check=False,
-            )
-            openscap_meta["openscap_status"] = "completed"
-            openscap_meta["openscap_profile"] = profile
-            openscap_meta["openscap_datastream"] = str(datastream)
-            openscap_meta.update(parse_openscap_results(openscap_xml))
-        except Exception:
-            openscap_meta["openscap_status"] = "failed"
-    else:
-        openscap_meta["openscap_status"] = "datastream_not_found"
-
-    failed_rule_lines: List[str] = []
-    if openscap_xml.exists():
-        try:
-            tree = ET.parse(openscap_xml)
-        except ET.ParseError:
-            tree = None
-        if tree is not None:
-            root = tree.getroot()
-        else:
-            root = None
-    else:
-        root = None
-    if root is not None:
-        for elem in root.iter():
-            tag = elem.tag.split("}", 1)[-1]
-            if tag != "rule-result":
-                continue
-            rule_id = elem.attrib.get("idref", "N/A")
-            result_value = ""
-            for child in elem:
-                if child.tag.split("}", 1)[-1] == "result" and child.text:
-                    result_value = child.text.strip().lower()
-                    break
-            if result_value == "fail":
-                failed_rule_lines.append(f"openscap_failed_rule[]={rule_id}")
-
-    with openscap_data_path.open("w", encoding="utf-8") as handle:
-        handle.write("# OpenSCAP snapshot\n")
-        handle.write(f"openscap_datetime={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        for key, value in openscap_meta.items():
-            handle.write(f"{key}={value}\n")
-        for line in failed_rule_lines[:200]:
-            handle.write(line + "\n")
 
 
 def parse_skip_reasons_from_log(log_path: Path | None) -> Dict[str, List[str]]:
@@ -589,7 +412,6 @@ def render_html(
     report_path: Path,
     logo_data_uri: str,
     system_data: ParsedReport | None = None,
-    openscap_data: ParsedReport | None = None,
     log_path: Path | None = None,
 ) -> str:
     values = parsed.values
@@ -619,8 +441,6 @@ def render_html(
 
     sys_values = system_data.values if system_data else {}
     sys_arrays = system_data.arrays if system_data else {}
-    oscap_values = openscap_data.values if openscap_data else {}
-    oscap_arrays = openscap_data.arrays if openscap_data else {}
 
     timezone = sys_values.get("timezone", "Unknown")
     keyboard_layout = sys_values.get("keyboard_layout", "Unknown")
@@ -642,6 +462,8 @@ def render_html(
     mount_info = sys_arrays.get("mount_info", [])
     open_ports = sys_arrays.get("open_port", [])
     running_services_full = sys_arrays.get("running_service_full", [])
+    service_status_entries = sys_arrays.get("service_status", [])
+    service_enablement_entries = sys_arrays.get("service_enablement", [])
     sshd_effective = sys_arrays.get("sshd_effective", [])
     security_sysctl = sys_arrays.get("security_sysctl", [])
     upgradeable_packages = sys_arrays.get("upgradeable_package", [])
@@ -650,7 +472,8 @@ def render_html(
     suid_sgid_files = sys_arrays.get("suid_sgid_file", [])
     world_writable_files = sys_arrays.get("world_writable_file", [])
     cert_expiry = sys_arrays.get("cert_expiry", [])
-    openscap_failed_rules = oscap_arrays.get("openscap_failed_rule", [])
+    user_auth_entries = sys_arrays.get("user_auth", [])
+    important_file_entries = sys_arrays.get("important_file", [])
 
     recommendation_rows: List[str] = []
     for entry in suggestions:
@@ -729,9 +552,82 @@ def render_html(
         "<li>No world-writable files found in sampled paths.</li>"
     ]
     cert_expiry_items = [f"<li>{escape(item)}</li>" for item in cert_expiry[:200]] or ["<li>N/A</li>"]
-    openscap_failed_rule_items = [f"<li>{escape(item)}</li>" for item in openscap_failed_rules[:200]] or [
-        "<li>No failed rules detected, or scan data unavailable.</li>"
-    ]
+    enablement_map: Dict[str, str] = {}
+    for entry in service_enablement_entries:
+        unit, sep, state = entry.partition("|")
+        if sep:
+            enablement_map[unit.strip()] = state.strip()
+
+    service_status_rows: List[str] = []
+    for entry in service_status_entries:
+        parts = [item.strip() for item in entry.split("|", 4)]
+        unit = parts[0] if len(parts) > 0 else "N/A"
+        load = parts[1] if len(parts) > 1 else "N/A"
+        active = parts[2] if len(parts) > 2 else "N/A"
+        sub = parts[3] if len(parts) > 3 else "N/A"
+        description = parts[4] if len(parts) > 4 else "N/A"
+        enabled_state = enablement_map.get(unit, "N/A")
+        service_status_rows.append(
+            "<tr>"
+            f"<td>{escape(unit)}</td>"
+            f"<td>{escape(load)}</td>"
+            f"<td>{escape(active)}</td>"
+            f"<td>{escape(sub)}</td>"
+            f"<td>{escape(enabled_state)}</td>"
+            f"<td>{escape(description)}</td>"
+            "</tr>"
+        )
+    if not service_status_rows:
+        service_status_rows.append("<tr><td colspan='6'>No service status information available.</td></tr>")
+
+    important_file_rows: List[str] = []
+    for entry in important_file_entries:
+        parts = [item.strip() for item in entry.split("|")]
+        file_path = parts[0] if parts else "N/A"
+        kv: Dict[str, str] = {}
+        for item in parts[1:]:
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            kv[key.strip()] = value.strip()
+        important_file_rows.append(
+            "<tr>"
+            f"<td>{escape(file_path)}</td>"
+            f"<td>{escape(kv.get('present', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('mode', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('owner', 'N/A'))}:{escape(kv.get('group', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('size', 'N/A'))}</td>"
+            f"<td><code>{escape(kv.get('preview', kv.get('error', 'N/A')))}</code></td>"
+            "</tr>"
+        )
+    if not important_file_rows:
+        important_file_rows.append("<tr><td colspan='6'>No critical file snapshot available.</td></tr>")
+
+    user_auth_rows: List[str] = []
+    for entry in user_auth_entries:
+        parts = [item.strip() for item in entry.split("|")]
+        username = parts[0] if parts else "N/A"
+        kv: Dict[str, str] = {}
+        for item in parts[1:]:
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            kv[key.strip()] = value.strip()
+        user_auth_rows.append(
+            "<tr>"
+            f"<td>{escape(username)}</td>"
+            f"<td>{escape(kv.get('uid', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('shell', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('password', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('ssh_allowed', 'N/A'))}</td>"
+            f"<td>{escape(kv.get('methods', 'none'))}</td>"
+            f"<td>{escape(kv.get('authorized_keys', '0'))}</td>"
+            f"<td>{escape(kv.get('groups', 'none'))}</td>"
+            f"<td>{escape(kv.get('key_preview', 'none'))}</td>"
+            "</tr>"
+        )
+    if not user_auth_rows:
+        user_auth_rows.append("<tr><td colspan='9'>No per-user authentication data available.</td></tr>")
 
     skipped_reason_map = parse_skip_reasons_from_log(log_path)
     test_rows, status_counts, priority_counts, actions, skipped_rows = build_test_rows(
@@ -761,20 +657,6 @@ def render_html(
     sugg_pct = int((status_counts["suggestion"] / total_checks) * 100)
     risk_level = "High" if hardening_score < 60 else "Medium" if hardening_score < 80 else "Controlled"
     risk_css = "risk-high" if hardening_score < 60 else "risk-medium" if hardening_score < 80 else "risk-low"
-    openscap_status = oscap_values.get("openscap_status", "not_available")
-    openscap_profile = oscap_values.get("openscap_profile", "N/A")
-    openscap_total_rules = oscap_values.get("openscap_total_rules", "0")
-    openscap_passed_rules = oscap_values.get("openscap_passed_rules", "0")
-    openscap_failed_rules_count = oscap_values.get("openscap_failed_rules", "0")
-    openscap_error_rules = oscap_values.get("openscap_error_rules", "0")
-    openscap_datastream = oscap_values.get("openscap_datastream", "N/A")
-    openscap_status_label = {
-        "completed": "Completed",
-        "failed": "Failed",
-        "datastream_not_found": "Datastream not found",
-        "not_run": "Not run",
-        "not_available": "Not available",
-    }.get(openscap_status, openscap_status)
 
     logo_html = f"<img src='{logo_data_uri}' alt='Logo' class='logo' />" if logo_data_uri else ""
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1037,78 +919,73 @@ def render_html(
     <div class="tabs">
       <button class="tab-btn active" data-tab="machine" type="button">Machine Information</button>
       <button class="tab-btn" data-tab="lynis" type="button">Scan Lynis</button>
-      <button class="tab-btn" data-tab="openscap" type="button">Scan OpenSCAP</button>
     </div>
 
     <section id="panel-machine" class="panel active">
-      <div class="grid">
-        <article class="card">
-          <h2>Overall Security Level</h2>
-          <div class="kpi {escape(score_css)}">{hardening_score}/100</div>
-          <div class="risk-pill {risk_css}">Risk: {risk_level}</div>
-          <div class="progress"><span style="width:{hardening_score}%"></span></div>
-          <div class="muted" style="margin-top: 6px;">Quick read: {escape(score_label)}</div>
-        </article>
-        <article class="card">
-          <h2>Result Distribution</h2>
-          <div class="donut"></div>
-          <div class="muted" style="margin-top:8px;">PASS: {status_counts["passed"]} | SUGGESTION: {status_counts["suggestion"]} | WARNING: {status_counts["warning"]}</div>
-        </article>
-        <article class="card">
-          <h2>Scan Coverage</h2>
-          <div class="kpi">{tests_done}</div>
-          <div class="muted">Executed tests: {len(tests_executed)} | Skipped tests: {len(tests_skipped)}</div>
-          <div class="muted">Lynis: {escape(lynis_version)}</div>
-        </article>
-        <article class="card">
-          <h2>Action Priorities</h2>
-          <div><span class="badge priority-p1">P1: {priority_counts["P1"]}</span> <span class="badge priority-p2">P2: {priority_counts["P2"]}</span> <span class="badge priority-p3">P3: {priority_counts["P3"]}</span></div>
-          <div class="muted" style="margin-top: 8px;">Started: {escape(started_at)}</div>
-          <div class="muted">Finished: {escape(ended_at)}</div>
-        </article>
-      </div>
-
       <div class="section">
-        <h3>Platform Context (Summary)</h3>
+        <h3>Machine Posture Overview</h3>
         <div class="grid">
           <article class="card">
-            <h2>Environment</h2>
-            <div><strong>Timezone:</strong> {escape(timezone)}</div>
-            <div><strong>Locale:</strong> {escape(system_locale)}</div>
-            <div><strong>Shell:</strong> {escape(shell_value)}</div>
+            <h2>Host and Runtime</h2>
+            <div><strong>Hostname:</strong> {escape(hostname)}</div>
+            <div><strong>OS:</strong> {escape(os_name)}</div>
+            <div><strong>Kernel:</strong> {escape(sys_values.get("kernel", "Unknown"))}</div>
             <div><strong>Uptime:</strong> {escape(uptime_human)}</div>
+            <div><strong>Load average:</strong> {escape(load_average)}</div>
+            <div><strong>Total memory (kB):</strong> {escape(memory_total_kb)}</div>
           </article>
           <article class="card">
-            <h2>Security Signals</h2>
-            <div><strong>Package manager:</strong> {escape(package_manager_value)}</div>
+            <h2>Security Controls</h2>
             <div><strong>Secure Boot:</strong> {escape(secure_boot_status)}</div>
             <div><strong>TPM:</strong> {escape(tpm_status)}</div>
             <div><strong>Disk encryption:</strong> {escape(encryption_summary)}</div>
+            <div><strong>Package manager:</strong> {escape(package_manager_value)}</div>
           </article>
           <article class="card">
-            <h2>Resources</h2>
-            <div><strong>Load avg:</strong> {escape(load_average)}</div>
-            <div><strong>Total RAM (kB):</strong> {escape(memory_total_kb)}</div>
-            <div><strong>Keyboard:</strong> {escape(keyboard_layout)} / {escape(keyboard_model)}</div>
+            <h2>Locale and Session</h2>
+            <div><strong>Timezone:</strong> {escape(timezone)}</div>
+            <div><strong>System locale:</strong> {escape(system_locale)}</div>
             <div><strong>LANG:</strong> {escape(lang_value)}</div>
+            <div><strong>Default shell:</strong> {escape(shell_value)}</div>
+            <div><strong>Keyboard:</strong> {escape(keyboard_layout)} / {escape(keyboard_model)}</div>
+          </article>
+          <article class="card">
+            <h2>Hardening Score Snapshot</h2>
+            <div class="kpi {escape(score_css)}">{hardening_score}/100</div>
+            <div class="risk-pill {risk_css}">Risk: {risk_level}</div>
+            <div class="progress"><span style="width:{hardening_score}%"></span></div>
+            <div class="muted" style="margin-top: 6px;">{escape(score_label)} posture based on Lynis scan.</div>
           </article>
         </div>
       </div>
 
+      <div class="section">
+        <h3>User Access and Authentication Matrix</h3>
+        <p class="muted">Includes shell access, SSH eligibility, account state, allowed methods, and authorized key footprint.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>User</th><th>UID</th><th>Shell</th><th>Password state</th><th>SSH allowed</th><th>Possible methods</th><th>Authorized keys</th><th>Groups</th><th>Key preview</th>
+            </tr>
+          </thead>
+          <tbody>{"".join(user_auth_rows)}</tbody>
+        </table>
+      </div>
+
       <details open>
-        <summary>Users and Accounts</summary>
+        <summary>User Inventory</summary>
         <table style="margin-top:10px;">
           <thead><tr><th>User</th><th>UID</th><th>GID</th><th>Home</th><th>Shell</th></tr></thead>
           <tbody>{"".join(user_rows)}</tbody>
         </table>
         <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>Locked Accounts</h2><ul>{"".join(locked_user_items)}</ul></article>
-          <article class="card"><h2>Home Directories (sample)</h2><ul>{"".join(home_dir_items)}</ul></article>
+          <article class="card"><h2>Locked accounts</h2><ul>{"".join(locked_user_items)}</ul></article>
+          <article class="card"><h2>Home directories (sample)</h2><ul>{"".join(home_dir_items)}</ul></article>
         </div>
       </details>
 
       <details>
-        <summary>Filesystem, Mounts and Important Paths</summary>
+        <summary>Filesystem and Permissions</summary>
         <table style="margin-top:10px;">
           <thead><tr><th>Path</th><th>Perm</th><th>Owner</th><th>Group</th></tr></thead>
           <tbody>{"".join(path_rows)}</tbody>
@@ -1116,6 +993,8 @@ def render_html(
         <div class="grid" style="margin-top:10px;">
           <article class="card"><h2>Filesystems (sample)</h2><ul>{"".join(fs_items)}</ul></article>
           <article class="card"><h2>Mounts (sample)</h2><ul>{"".join(mount_items)}</ul></article>
+          <article class="card"><h2>SUID/SGID files (sample)</h2><ul>{"".join(suid_sgid_items)}</ul></article>
+          <article class="card"><h2>World-writable files (sample)</h2><ul>{"".join(world_writable_items)}</ul></article>
         </div>
       </details>
 
@@ -1124,28 +1003,39 @@ def render_html(
         <div class="grid" style="margin-top:10px;">
           <article class="card"><h2>Running services (Lynis)</h2><ul>{"".join(service_items)}</ul></article>
           <article class="card"><h2>Enabled at boot (Lynis)</h2><ul>{"".join(boot_service_items)}</ul></article>
-        </div>
-        <div class="grid" style="margin-top:10px;">
           <article class="card"><h2>Listening endpoints (Lynis)</h2><ul>{"".join(network_listener_items)}</ul></article>
           <article class="card"><h2>Open ports (ss)</h2><ul>{"".join(open_port_items)}</ul></article>
         </div>
         <article class="card" style="margin-top:10px;"><h2>systemd running services</h2><ul>{"".join(running_service_full_items)}</ul></article>
+        <table style="margin-top:10px;">
+          <thead>
+            <tr><th>Service</th><th>Load</th><th>Active</th><th>Sub</th><th>Enabled</th><th>Description</th></tr>
+          </thead>
+          <tbody>{"".join(service_status_rows)}</tbody>
+        </table>
       </details>
 
       <details>
-        <summary>Security Baseline Snapshot</summary>
+        <summary>Hardening Baseline Data</summary>
         <div class="grid" style="margin-top:10px;">
           <article class="card"><h2>Security sysctl</h2><ul>{"".join(security_sysctl_items)}</ul></article>
           <article class="card"><h2>SSH effective config (sshd -T)</h2><ul>{"".join(sshd_effective_items)}</ul></article>
-        </div>
-        <div class="grid" style="margin-top:10px;">
           <article class="card"><h2>Upgradeable packages</h2><ul>{"".join(upgradeable_package_items)}</ul></article>
           <article class="card"><h2>Certificates expiry (sample)</h2><ul>{"".join(cert_expiry_items)}</ul></article>
         </div>
-        <div class="grid" style="margin-top:10px;">
-          <article class="card"><h2>SUID/SGID files (sample)</h2><ul>{"".join(suid_sgid_items)}</ul></article>
-          <article class="card"><h2>World-writable files (sample)</h2><ul>{"".join(world_writable_items)}</ul></article>
-        </div>
+      </details>
+
+      <details>
+        <summary>Critical Configuration Files Snapshot</summary>
+        <p class="muted" style="margin-top:8px;">Includes MOTD, SSH, PAM, sudoers, audit, logging, and kernel tuning related files.</p>
+        <table style="margin-top:10px;">
+          <thead>
+            <tr>
+              <th>File</th><th>Present</th><th>Mode</th><th>Owner</th><th>Size</th><th>Content Preview</th>
+            </tr>
+          </thead>
+          <tbody>{"".join(important_file_rows)}</tbody>
+        </table>
       </details>
     </section>
 
@@ -1239,31 +1129,6 @@ def render_html(
       </details>
     </section>
 
-    <section id="panel-openscap" class="panel">
-      <div class="section">
-        <h3>OpenSCAP Summary</h3>
-        <div class="grid">
-          <article class="card">
-            <h2>Scan status</h2>
-            <div class="kpi">{escape(openscap_status_label)}</div>
-            <div class="muted">Profile: {escape(openscap_profile)}</div>
-            <div class="muted">Datastream: <code>{escape(openscap_datastream)}</code></div>
-          </article>
-          <article class="card">
-            <h2>Evaluated rules</h2>
-            <div class="kpi">{escape(openscap_total_rules)}</div>
-            <div class="muted">Passed: {escape(openscap_passed_rules)}</div>
-            <div class="muted">Failed: {escape(openscap_failed_rules_count)}</div>
-            <div class="muted">Errors: {escape(openscap_error_rules)}</div>
-          </article>
-        </div>
-      </div>
-
-      <div class="section">
-        <h3>OpenSCAP failed rules (sample)</h3>
-        <ul>{"".join(openscap_failed_rule_items)}</ul>
-      </div>
-    </section>
   </div>
 
   <script>
@@ -1312,7 +1177,6 @@ def render_html(
           btn.classList.add("active");
           document.getElementById("panel-machine").classList.toggle("active", tab === "machine");
           document.getElementById("panel-lynis").classList.toggle("active", tab === "lynis");
-          document.getElementById("panel-openscap").classList.toggle("active", tab === "openscap");
         }});
       }});
     }})();
@@ -1352,11 +1216,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Lynis log file to extract skipped test reasons (default: infer from report name).",
     )
     parser.add_argument(
-        "--openscap-data",
-        default=None,
-        help="Optional path to OpenSCAP snapshot data (default: infer from report name).",
-    )
-    parser.add_argument(
         "--full-run",
         action="store_true",
         default=True,
@@ -1379,8 +1238,6 @@ def main() -> int:
     system_data_path = Path(args.system_data) if args.system_data else inferred_system_path
     inferred_log_path = default_log_path(report_path)
     log_path = Path(args.log_file) if args.log_file else inferred_log_path
-    inferred_openscap_path = default_openscap_data_path(report_path)
-    openscap_data_path = Path(args.openscap_data) if args.openscap_data else inferred_openscap_path
 
     run_full = args.full_run and not args.report_only
 
@@ -1389,7 +1246,6 @@ def main() -> int:
             report_path=report_path,
             log_path=log_path,
             system_data_path=system_data_path,
-            openscap_data_path=openscap_data_path,
         )
     elif not report_path.exists():
         parser.error(f"Input report file not found: {report_path}")
@@ -1408,17 +1264,12 @@ def main() -> int:
     if system_data_path.exists():
         system_data = parse_report_file(system_data_path)
 
-    openscap_data: ParsedReport | None = None
-    if openscap_data_path.exists():
-        openscap_data = parse_report_file(openscap_data_path)
-
     output_path.write_text(
         render_html(
             parsed,
             report_path,
             logo_data_uri,
             system_data=system_data,
-            openscap_data=openscap_data,
             log_path=log_path,
         ),
         encoding="utf-8",
