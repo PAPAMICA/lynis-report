@@ -735,24 +735,84 @@ def collect_cert_expiry(limit: int = 80) -> List[Dict[str, str]]:
 
 
 def collect_upgradeable() -> List[str]:
+    """Return a list of packages with available updates, one per entry."""
     mgr = _pkg_mgr()
+    pkgs: List[str] = []
+
     if mgr == "apt":
-        out = _run(["apt", "list", "--upgradable"])
-        return [l for l in out.splitlines() if l.strip() and not l.startswith("Listing")]
-    if mgr == "dnf":
-        out = _run(["dnf", "check-update", "--refresh"])
-        return [l for l in out.splitlines() if l.strip() and not l.startswith(("Last", "Obsol"))]
-    if mgr == "yum":
-        out = _run(["yum", "check-update"])
-        return [l for l in out.splitlines() if l.strip() and not l.startswith("Loaded")]
-    if mgr == "zypper":
+        # apt-get --dry-run upgrade emits "Inst pkg [old] (new repo)" for every upgradable pkg
+        # More reliable than `apt list --upgradable` which may emit ANSI/WARNING noise
+        out = _run(["apt-get", "--dry-run", "upgrade"])
+        for ln in out.splitlines():
+            ln = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+            if ln.startswith("Inst "):
+                # "Inst bash [5.1-2] (5.2-1 Debian:stable [amd64])"
+                parts = ln.split()
+                pkg = parts[1] if len(parts) > 1 else ln
+                # grab new version if present inside parentheses
+                m = re.search(r"\(([^\s)]+)", ln)
+                ver = f"  →  {m.group(1)}" if m else ""
+                pkgs.append(f"{pkg}{ver}")
+        # Fallback: if apt-get dry-run returned nothing (e.g. partial installs state),
+        # try apt list --upgradable
+        if not pkgs:
+            out2 = _run(["apt", "list", "--upgradable"])
+            for ln in out2.splitlines():
+                ln = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+                if ln and not ln.lower().startswith(("listing", "warning", "note")):
+                    pkgs.append(ln)
+
+    elif mgr == "dnf":
+        # `dnf list --upgrades` is more parseable than `check-update` (which exits 100)
+        out = _run(["dnf", "list", "--upgrades", "--quiet"])
+        for ln in out.splitlines():
+            ln = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+            if not ln or ln.lower().startswith(("last metadata", "available upgrade",
+                                                 "updated package", "obsolet")):
+                continue
+            # "pkg.arch  version  repo" — at least two fields
+            if re.match(r"^\S+\.\S+\s+\S+", ln):
+                parts = ln.split()
+                pkgs.append(f"{parts[0]}  →  {parts[1]}" if len(parts) >= 2 else parts[0])
+
+    elif mgr == "yum":
+        out = _run(["yum", "list", "updates", "--quiet"])
+        for ln in out.splitlines():
+            ln = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+            if not ln or ln.lower().startswith(("loaded plugin", "repo id",
+                                                 "updated package")):
+                continue
+            if re.match(r"^\S+\.\S+\s+\S+", ln):
+                parts = ln.split()
+                pkgs.append(f"{parts[0]}  →  {parts[1]}" if len(parts) >= 2 else parts[0])
+
+    elif mgr == "zypper":
         out = _run(["zypper", "--no-refresh", "list-updates"])
-        return [l for l in out.splitlines()[2:] if l.strip()]
-    if mgr == "pacman":
-        return _run(["pacman", "-Qu"]).splitlines()
-    if mgr == "apk":
-        return _run(["apk", "version", "-l", "<"]).splitlines()
-    return []
+        for ln in out.splitlines():
+            ln = ln.strip()
+            # Skip header rows: "Loading...", "S | Repository | ...", separator lines
+            if not ln or re.match(r"^[-+|=]+$", ln) or ln.startswith(("S |", "Loading",
+                                                                         "Repository data")):
+                continue
+            if "|" in ln:
+                # "v | repo | pkg | old_ver | new_ver | arch"
+                cols = [c.strip() for c in ln.split("|")]
+                if len(cols) >= 5 and cols[0].lower() != "s":
+                    pkgs.append(f"{cols[2]}  →  {cols[4]}" if cols[2] else ln)
+
+    elif mgr == "pacman":
+        out = _run(["pacman", "-Qu"])
+        pkgs = [re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+                for ln in out.splitlines() if ln.strip()]
+
+    elif mgr == "apk":
+        out = _run(["apk", "version", "-l", "<"])
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if ln and not ln.lower().startswith(("installed", "fetch")):
+                pkgs.append(ln)
+
+    return pkgs
 
 
 def collect_audit_rules() -> List[str]:
@@ -1021,8 +1081,37 @@ def parse_skip_reasons_from_log(log_path: Optional[Path]) -> Dict[str, List[str]
     return reasons
 
 
+_CUSTOM_PRF_SRC = Path(__file__).parent / "custom.prf"
+
+
+def _deploy_custom_prf() -> None:
+    """Copy custom.prf into the Lynis profile directory if not already present."""
+    if not _CUSTOM_PRF_SRC.exists():
+        return
+    # Detect Lynis profile directory
+    for candidate in [
+        Path("/etc/lynis"),
+        Path("/usr/local/etc/lynis"),
+        Path("/usr/share/lynis"),
+    ]:
+        if candidate.exists():
+            dest = candidate / "custom.prf"
+            try:
+                if not dest.exists() or dest.read_bytes() != _CUSTOM_PRF_SRC.read_bytes():
+                    sudo_prefix = ["sudo"] if os.geteuid() != 0 else []
+                    subprocess.run(sudo_prefix + ["cp", str(_CUSTOM_PRF_SRC), str(dest)], check=True)
+                    print(f"[INFO] custom.prf deployed to {dest}")
+                else:
+                    print(f"[INFO] custom.prf already up-to-date at {dest}")
+            except Exception as e:
+                print(f"[WARN] Could not deploy custom.prf to {dest}: {e}", file=sys.stderr)
+            return
+    print("[WARN] Could not find Lynis profile directory — custom.prf not deployed.", file=sys.stderr)
+
+
 def install_lynis() -> None:
     if shutil.which("lynis"):
+        _deploy_custom_prf()
         return
     print("[INFO] Lynis not found, installing...")
     mgr = _pkg_mgr()
@@ -1039,6 +1128,7 @@ def install_lynis() -> None:
     if not shutil.which("lynis"):
         raise RuntimeError("Lynis installation failed.")
     print("[INFO] Lynis installed.")
+    _deploy_custom_prf()
 
 
 def run_lynis(report_path: Path, log_path: Path) -> None:
@@ -1699,7 +1789,17 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri, cfg: Optional[D
     if not cert_h:
         cert_h.append("<tr><td colspan='5' class='center muted'>No certificate data.</td></tr>")
     upgrades = sys_data.get("upgrades", [])
-    upg_h  = "".join(f"<tr><td class='mono small'>{esc(x)}</td></tr>" for x in upgrades[:300]) or "<tr><td class='muted center'>No pending updates.</td></tr>"
+    def _fmt_upg_row(x: str) -> str:
+        # "pkg  →  new_ver" format (set by collect_upgradeable) or raw line
+        if "→" in x:
+            pkg, _, ver = x.partition("→")
+            return (f"<tr><td class='mono small'>{esc(pkg.strip())}</td>"
+                    f"<td class='mono small text-warn'>{esc(ver.strip())}</td></tr>")
+        return f"<tr><td class='mono small' colspan='2'>{esc(x)}</td></tr>"
+
+    upg_h = "".join(_fmt_upg_row(x) for x in upgrades[:300]) or \
+            "<tr><td class='muted center' colspan='2'>No pending updates — system is up to date.</td></tr>"
+    upg_thead = "<tr><th>Package</th><th>Available version</th></tr>"
     audit  = sys_data.get("audit", [])
     audit_h= "".join(f"<tr><td class='mono'>{esc(x)}</td></tr>" for x in audit) or "<tr><td class='muted center'>No audit rules.</td></tr>"
     _h = []
@@ -1910,7 +2010,7 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri, cfg: Optional[D
   <div class="subsection">
     <div class="subsec-hdr">{icon('package',14)} Pending Software Updates {badge(str(len(upgrades)),'warn' if upgrades else 'green')}</div>
     <p class="sec-desc">Unpatched software is one of the leading causes of security breaches. Each pending update may contain fixes for known CVEs. Systems should be updated regularly, and a patch management process should be established.</p>
-    <div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>Package with pending update</th></tr></thead><tbody>{upg_h}</tbody></table></div>
+    <div class="tbl-wrap" style="max-height:300px"><table><thead>{upg_thead}</thead><tbody>{upg_h}</tbody></table></div>
   </div>
 
   <div class="subsection">
