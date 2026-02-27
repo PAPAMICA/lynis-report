@@ -303,10 +303,16 @@ def collect_services() -> List[Dict[str, str]]:
     out = _run(["systemctl", "list-units", "--type=service", "--all",
                 "--no-pager", "--no-legend"])
     for ln in out.splitlines():
-        p = ln.split(None, 4)
+        # strip ANSI, bullet "●" prefix, and whitespace
+        clean = re.sub(r'\x1b\[[0-9;]*m', '', ln).strip()
+        clean = clean.lstrip("\u25cf\u25cb\u2022").strip()
+        p = clean.split(None, 4)
         if len(p) < 4:
             continue
         unit = p[0]
+        # only accept valid service unit names
+        if not unit.endswith(".service"):
+            continue
         svcs.append({"unit": unit, "load": p[1], "active": p[2], "sub": p[3],
                      "enabled": enab.get(unit, "—"), "desc": p[4].strip() if len(p) > 4 else ""})
     return svcs
@@ -338,20 +344,116 @@ def collect_ports() -> List[Dict[str, str]]:
     return ports
 
 
+def _parse_iptables(lines: List[str]) -> List[Dict[str, str]]:
+    """Parse iptables-save output into structured rows."""
+    rows = []
+    table = ""
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if ln.startswith("*"):
+            table = ln[1:]
+            continue
+        if ln.startswith(":"):
+            parts = ln[1:].split()
+            chain = parts[0] if parts else ln[1:]
+            policy = parts[1] if len(parts) > 1 else "—"
+            rows.append({"table": table, "chain": chain, "target": policy,
+                         "proto": "—", "src": "—", "dst": "—", "opts": "(default policy)"})
+            continue
+        if ln.startswith("-A") or ln.startswith("-I"):
+            parts = ln.split()
+            chain = parts[1] if len(parts) > 1 else "—"
+            target = proto = src = dst = ""
+            i = 2
+            while i < len(parts):
+                if parts[i] == "-j" and i+1 < len(parts):
+                    target = parts[i+1]; i += 2
+                elif parts[i] == "-p" and i+1 < len(parts):
+                    proto = parts[i+1]; i += 2
+                elif parts[i] == "-s" and i+1 < len(parts):
+                    src = parts[i+1]; i += 2
+                elif parts[i] == "-d" and i+1 < len(parts):
+                    dst = parts[i+1]; i += 2
+                else:
+                    i += 1
+            opts_parts = [p for p in parts[2:] if p not in
+                          ("-j", target, "-p", proto, "-s", src, "-d", dst)]
+            rows.append({"table": table, "chain": chain,
+                         "target": target or "—", "proto": proto or "any",
+                         "src": src or "any", "dst": dst or "any",
+                         "opts": " ".join(opts_parts)[:80]})
+    return rows
+
+
+def _parse_nft(lines: List[str]) -> List[Dict[str, str]]:
+    """Parse nft list ruleset into structured rows."""
+    rows = []
+    table = chain = ""
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        m = re.match(r'^table\s+(\w+)\s+(\w+)', stripped)
+        if m:
+            table = f"{m.group(1)} {m.group(2)}"; chain = ""; continue
+        m2 = re.match(r'^chain\s+(\S+)', stripped)
+        if m2:
+            chain = m2.group(1); continue
+        if stripped in ("{", "}"):
+            if stripped == "}":
+                chain = "" if chain else table
+            continue
+        if table and chain:
+            rows.append({"table": table, "chain": chain, "rule": stripped})
+        elif table and not chain:
+            rows.append({"table": table, "chain": "—", "rule": stripped})
+    return rows
+
+
+def _parse_ufw(lines: List[str]) -> List[Dict[str, str]]:
+    """Parse ufw status verbose into structured rows."""
+    rows = []
+    in_rules = False
+    for ln in lines:
+        stripped = ln.strip()
+        if stripped.startswith("--"):
+            in_rules = True; continue
+        if not in_rules:
+            continue
+        if not stripped:
+            continue
+        parts = re.split(r'\s{2,}', stripped)
+        if len(parts) >= 3:
+            rows.append({"to": parts[0].strip(), "action": parts[1].strip(), "from": parts[2].strip()})
+        elif len(parts) == 2:
+            rows.append({"to": parts[0].strip(), "action": parts[1].strip(), "from": "Anywhere"})
+    return rows
+
+
 def collect_firewall() -> Dict[str, Any]:
-    fw: Dict[str, Any] = {"type": "none", "nft": [], "ipt": [], "ufw": [], "ufw_active": False}
+    fw: Dict[str, Any] = {
+        "type": "none",
+        "nft": [], "nft_parsed": [],
+        "ipt": [], "ipt_parsed": [],
+        "ufw": [], "ufw_parsed": [], "ufw_active": False,
+    }
     nft = _run(["nft", "list", "ruleset"], sudo=True)
     if nft.strip():
-        fw["nft"]  = [l for l in nft.splitlines() if l.strip()]
-        fw["type"] = "nftables"
+        fw["nft"]        = [l for l in nft.splitlines() if l.strip()]
+        fw["nft_parsed"] = _parse_nft(fw["nft"])
+        fw["type"]       = "nftables"
     ipt = _run(["iptables-save"], sudo=True)
     if ipt.strip():
-        fw["ipt"]  = [l for l in ipt.splitlines() if l.strip()]
+        fw["ipt"]        = [l for l in ipt.splitlines() if l.strip()]
+        fw["ipt_parsed"] = _parse_iptables(fw["ipt"])
         if fw["type"] == "none":
-            fw["type"] = "iptables"
+            fw["type"]   = "iptables"
     if shutil.which("ufw"):
         ufw = _run(["ufw", "status", "verbose"], sudo=True)
         fw["ufw"]        = [l for l in ufw.splitlines() if l.strip()]
+        fw["ufw_parsed"] = _parse_ufw(fw["ufw"])
         fw["ufw_active"] = "Status: active" in ufw
     return fw
 
@@ -1097,6 +1199,17 @@ tr:last-child td{border-bottom:none}
 /* sshd security row highlight */
 tr.sshd-sec{background:#fffdf5}
 
+/* Subsection (within collapsible) */
+.subsection{background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:14px 18px}
+.subsec-hdr{font-size:.88rem;font-weight:700;display:flex;align-items:center;gap:7px;
+  margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border);color:var(--text)}
+.subsec-hdr svg{color:var(--primary)}
+
+/* Section description */
+.sec-desc{font-size:.83rem;color:var(--muted);line-height:1.65;margin-bottom:12px;
+  background:#f8fafc;border-left:3px solid var(--primary-light);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0}
+.sec-desc code,.sec-desc em{color:var(--text);font-style:normal;font-weight:500}
+
 /* Print */
 @media print{
   .tabs,.filter-bar,.search-input{display:none!important}
@@ -1297,12 +1410,49 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
         )
     if not port_rows_html:
         port_rows_html.append("<tr><td colspan='6' class='center muted'>No port data (requires root).</td></tr>")
-    fw = sys_data.get("firewall", {})
-    fw_type  = fw.get("type","none")
-    nft_lines= "".join(f"<tr><td class='mono'>{esc(l)}</td></tr>" for l in fw.get("nft",[])[:400]) or "<tr><td class='muted'>No NFT rules.</td></tr>"
-    ipt_lines= "".join(f"<tr><td class='mono'>{esc(l)}</td></tr>" for l in fw.get("ipt",[])[:400]) or "<tr><td class='muted'>No iptables rules.</td></tr>"
-    ufw_lines= "".join(f"<tr><td class='mono'>{esc(l)}</td></tr>" for l in fw.get("ufw",[])[:100]) or "<tr><td class='muted'>UFW not available.</td></tr>"
+    fw  = sys_data.get("firewall", {})
+    fw_type   = fw.get("type","none")
     ufw_active= fw.get("ufw_active", False)
+
+    nft_parsed = fw.get("nft_parsed", [])
+    if nft_parsed:
+        nft_rows_h = "".join(
+            f"<tr><td class='mono muted small'>{esc(r.get('table',''))}</td>"
+            f"<td class='mono'>{esc(r.get('chain',''))}</td>"
+            f"<td class='mono small'>{esc(r.get('rule','')[:100])}</td></tr>"
+            for r in nft_parsed[:500]
+        )
+        nft_lines = f"<thead><tr><th>Table</th><th>Chain</th><th>Rule</th></tr></thead><tbody>{nft_rows_h}</tbody>"
+    else:
+        nft_lines = "<thead><tr><th>Rule</th></tr></thead><tbody><tr><td class='muted'>No NFT rules detected.</td></tr></tbody>"
+
+    ipt_parsed = fw.get("ipt_parsed", [])
+    if ipt_parsed:
+        ipt_rows_h = "".join(
+            f"<tr><td class='mono muted small'>{esc(r.get('table',''))}</td>"
+            f"<td class='mono'>{esc(r.get('chain',''))}</td>"
+            f"<td>{badge(r.get('target','—'), 'green' if r.get('target') in ('ACCEPT','RETURN') else 'red' if r.get('target') in ('DROP','REJECT') else 'blue')}</td>"
+            f"<td class='mono muted'>{esc(r.get('proto',''))}</td>"
+            f"<td class='mono muted'>{esc(r.get('src',''))}</td>"
+            f"<td class='mono muted'>{esc(r.get('dst',''))}</td>"
+            f"<td class='mono small muted'>{esc(r.get('opts','')[:60])}</td></tr>"
+            for r in ipt_parsed[:500]
+        )
+        ipt_lines = f"<thead><tr><th>Table</th><th>Chain</th><th>Target</th><th>Proto</th><th>Source</th><th>Destination</th><th>Options</th></tr></thead><tbody>{ipt_rows_h}</tbody>"
+    else:
+        ipt_lines = "<thead><tr><th>Rule</th></tr></thead><tbody><tr><td class='muted'>No iptables rules detected.</td></tr></tbody>"
+
+    ufw_parsed = fw.get("ufw_parsed", [])
+    if ufw_parsed:
+        ufw_rows_h = "".join(
+            f"<tr><td class='mono bold'>{esc(r.get('to',''))}</td>"
+            f"<td>{badge(r.get('action',''), 'green' if 'ALLOW' in r.get('action','').upper() else 'red' if 'DENY' in r.get('action','').upper() else 'blue')}</td>"
+            f"<td class='mono'>{esc(r.get('from',''))}</td></tr>"
+            for r in ufw_parsed[:200]
+        )
+        ufw_lines = f"<thead><tr><th>To (port/service)</th><th>Action</th><th>From</th></tr></thead><tbody>{ufw_rows_h}</tbody>"
+    else:
+        ufw_lines = "<thead><tr><th>Rule</th></tr></thead><tbody><tr><td class='muted'>UFW not active or no rules configured.</td></tr></tbody>"
     mounts = sys_data.get("mounts", [])
     mount_rows_html = []
     for m in mounts:
@@ -1313,13 +1463,19 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
     disk_rows_html = []
     for d in disk:
         pi = d.get("pct_int", 0)
-        bc = "danger" if pi >= 90 else "warn" if pi >= 75 else "ok"
-        tc = " class='text-danger'" if pi >= 90 else (" class='text-warn'" if pi >= 75 else "")
+        bc    = "danger" if pi >= 90 else "warn" if pi >= 75 else "ok"
+        color = "var(--danger)" if pi >= 90 else ("var(--warn)" if pi >= 75 else "var(--ok)")
+        pct_label = esc(d.get('pct','0%'))
         disk_rows_html.append(
-            f"<tr><td class='mono'>{esc(d.get('mp',''))}</td><td class='mono muted'>{esc(d.get('src',''))}</td>"
-            f"<td>{esc(d.get('size',''))}</td><td>{esc(d.get('used',''))}</td><td>{esc(d.get('avail',''))}</td>"
-            f"<td><div style='display:flex;align-items:center;gap:6px'><div class='disk-bar' style='min-width:80px'>"
-            f"<span class='{bc}' style='width:{pi}%'></span></div><span{tc}>{esc(d.get('pct',''))}</span></div></td></tr>"
+            f"<tr><td class='mono'>{esc(d.get('mp',''))}</td><td class='mono muted small'>{esc(d.get('src',''))}</td>"
+            f"<td class='mono'>{esc(d.get('size',''))}</td><td class='mono'>{esc(d.get('used',''))}</td><td class='mono'>{esc(d.get('avail',''))}</td>"
+            f"<td style='min-width:160px'>"
+            f"<div style='display:flex;align-items:center;gap:8px'>"
+            f"<div style='flex:1;height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden'>"
+            f"<div style='width:{pi}%;height:100%;background:{color};border-radius:999px;transition:width .3s'></div>"
+            f"</div>"
+            f"<span style='font-size:.82rem;font-weight:700;color:{color};min-width:38px;text-align:right'>{pct_label}</span>"
+            f"</div></td></tr>"
         )
     if not disk_rows_html:
         disk_rows_html.append("<tr><td colspan='6' class='center muted'>No disk data.</td></tr>")
@@ -1489,6 +1645,7 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 <details open>
 <summary>{icon('users')} Users &amp; Authentication <span class="caret">&#9658;</span></summary>
 <div class="det-body">
+  <p class="sec-desc">This section lists all user accounts with a UID &ge; 1000 (standard users) plus root. It shows the authentication method (password / key), interactive login capability, and group membership. Pay special attention to accounts with <em>locked passwords</em>, <em>SSH keys</em>, and any non-root account holding <em>UID 0</em>.</p>
   {uid0_alert}
   <div class="tbl-wrap scrollable" style="margin-bottom:14px">
     <table><thead><tr><th>Username</th><th>UID</th><th>Home</th><th>Shell</th><th>Login</th><th>Password</th><th>SSH Keys</th><th>Key Preview</th><th>Groups</th></tr></thead>
@@ -1504,6 +1661,7 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 <details>
 <summary>{icon('activity')} Services <span class="badge badge-gray" style="margin-left:4px">{len(services)}</span> <span class="caret">&#9658;</span></summary>
 <div class="det-body" style="padding:0">
+  <p class="sec-desc" style="margin:12px 16px 0">Services running on a system represent its attack surface. Each unnecessary or misconfigured service is a potential entry point for an attacker. <em>Active/enabled</em> services should be reviewed and any service not required for the system&apos;s purpose should be disabled. Services in a <em>failed</em> state may indicate tampering or configuration issues.</p>
   <div class="filter-bar"><span class="muted small">All systemd services &mdash; load, active state, enablement</span><span class="spacer"></span><input class="search-input" id="svc-search" placeholder="Search services..." type="search"/></div>
   <div class="tbl-wrap scrollable"><table id="svc-tbl"><thead><tr><th style="width:240px">Service Unit</th><th style="width:80px">Load</th><th style="width:90px">Active</th><th style="width:90px">Sub-state</th><th style="width:90px">Enabled</th><th>Description</th></tr></thead>
   <tbody>{"".join(svc_rows_html)}</tbody></table></div>
@@ -1512,6 +1670,7 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 <details>
 <summary>{icon('globe')} Network &amp; Open Ports <span class="caret">&#9658;</span></summary>
 <div class="det-body" style="padding:0">
+  <p class="sec-desc" style="margin:12px 16px 0">Open ports represent active network listeners. Each exposed port increases the system&apos;s attack surface. Only ports required by the system&apos;s function should be open. Port information is collected via <code>ss -tulpen</code>. Ports listening on <em>0.0.0.0</em> or <em>::</em> are accessible from any network interface.</p>
   <div class="filter-bar"><span class="muted small">Listening sockets (TCP/UDP) &mdash; <code>ss -tulpen</code></span><span class="spacer"></span><input class="search-input" id="port-search" placeholder="Search ports, process..." type="search"/></div>
   <div class="tbl-wrap scrollable"><table id="port-tbl"><thead><tr><th>Protocol</th><th>State</th><th>Local Address</th><th>Port</th><th>Process</th><th>PID</th></tr></thead>
   <tbody>{"".join(port_rows_html)}</tbody></table></div>
@@ -1519,59 +1678,138 @@ def render_html(sys_data, lynis, lynis_path, log_path, logo_uri):
 </details>
 <details>
 <summary>{icon('flame')} Firewall <span class="badge badge-{'green' if fw_type!='none' else 'red'}">{esc(fw_type)}</span> <span class="caret">&#9658;</span></summary>
-<div class="det-body">
-  <div class="card-grid">
-    <div class="card"><div class="card-title">NFTables</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>Rule</th></tr></thead><tbody>{nft_lines}</tbody></table></div></div>
-    <div class="card"><div class="card-title">iptables</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>Rule</th></tr></thead><tbody>{ipt_lines}</tbody></table></div></div>
-    <div class="card"><div class="card-title">UFW {badge('active','green') if ufw_active else badge('inactive','gray')}</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>Rule</th></tr></thead><tbody>{ufw_lines}</tbody></table></div></div>
+<div class="det-body" style="display:flex;flex-direction:column;gap:18px">
+  <p class="sec-desc">Firewall rules control which network traffic is allowed to enter, leave, or traverse the system. The rules below are collected from all active firewall backends detected on this host. A missing or permissive ruleset significantly increases exposure to network-based attacks.</p>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('flame',14)} NFTables {badge(str(len(fw.get('nft_parsed',[])))+ ' rules', 'green' if fw.get('nft_parsed') else 'gray')}</div>
+    <div class="tbl-wrap scrollable"><table>{nft_lines}</table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('flame',14)} iptables / ip6tables {badge(str(len(fw.get('ipt_parsed',[])))+ ' rules', 'green' if fw.get('ipt_parsed') else 'gray')}</div>
+    <div class="tbl-wrap scrollable"><table>{ipt_lines}</table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('flame',14)} UFW (Uncomplicated Firewall) {badge('active','green') if ufw_active else badge('inactive','gray')}</div>
+    <div class="tbl-wrap scrollable"><table>{ufw_lines}</table></div>
   </div>
 </div>
 </details>""")
     _h.append(f"""
 <details>
 <summary>{icon('drive')} Filesystem &amp; Storage <span class="caret">&#9658;</span></summary>
-<div class="det-body">
-  <div style="font-size:.82rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Disk Usage</div>
-  <div class="tbl-wrap" style="margin-bottom:14px"><table><thead><tr><th>Mountpoint</th><th>Device</th><th>Total</th><th>Used</th><th>Available</th><th>Usage</th></tr></thead><tbody>{"".join(disk_rows_html)}</tbody></table></div>
-  <div style="font-size:.82rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Mount Points</div>
-  <div class="tbl-wrap scrollable" style="margin-bottom:14px"><table><thead><tr><th>Target</th><th>Source</th><th>Filesystem</th><th>Options</th></tr></thead><tbody>{"".join(mount_rows_html)}</tbody></table></div>
-  <div class="card-grid">
-    <div class="card"><div class="card-title">{icon('lock',13)} Important Path Permissions</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>Path</th><th>Mode</th><th>Owner</th><th>Group</th></tr></thead><tbody>{"".join(imp_path_rows)}</tbody></table></div></div>
-    <div class="card"><div class="card-title">{icon('alert',13)} SUID/SGID Files (sample)</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>File</th></tr></thead><tbody>{suid_h}</tbody></table></div></div>
-    <div class="card"><div class="card-title">{icon('alert',13)} World-Writable Files (sample)</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>File</th></tr></thead><tbody>{ww_h}</tbody></table></div></div>
+<div class="det-body" style="display:flex;flex-direction:column;gap:18px">
+  <p class="sec-desc">Filesystem security covers disk usage monitoring, mount point options (e.g. <code>noexec</code>, <code>nosuid</code>), file ownership and permissions on sensitive paths, and detection of privilege escalation vectors such as SUID/SGID files and world-writable locations.</p>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('database',14)} Disk Usage</div>
+    <div class="tbl-wrap"><table><thead><tr><th>Mountpoint</th><th>Device</th><th>Total</th><th>Used</th><th>Available</th><th style="min-width:180px">Usage</th></tr></thead><tbody>{"".join(disk_rows_html)}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('drive',14)} Mount Points &amp; Options</div>
+    <p class="sec-desc">Mount options like <code>noexec</code>, <code>nosuid</code>, and <code>nodev</code> provide important hardening. For example, <em>/tmp</em> and <em>/home</em> should ideally be mounted with <code>noexec</code> to prevent executing files placed there by an attacker.</p>
+    <div class="tbl-wrap scrollable"><table><thead><tr><th>Target</th><th>Source</th><th>Filesystem</th><th>Options</th></tr></thead><tbody>{"".join(mount_rows_html)}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('lock',14)} Important Path Permissions</div>
+    <p class="sec-desc">Critical system files and directories must have strict permissions. World-writable entries or incorrect ownership on files like <em>/etc/shadow</em>, <em>/etc/sudoers</em>, or <em>/etc/crontab</em> can be exploited for privilege escalation. Permissions in <em class="text-danger">red</em> indicate world-writable access.</p>
+    <div class="tbl-wrap"><table><thead><tr><th>Path</th><th>Mode</th><th>Owner</th><th>Group</th></tr></thead><tbody>{"".join(imp_path_rows)}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('alert',14)} SUID / SGID Files <span class="muted small">(sampled from key directories)</span></div>
+    <p class="sec-desc">SUID/SGID files run with elevated privileges regardless of who executes them. Unexpected SUID binaries are a common persistence and privilege escalation vector. Any binary not part of the base OS distribution should be investigated.</p>
+    <div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>File</th></tr></thead><tbody>{suid_h}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('alert',14)} World-Writable Files <span class="muted small">(sampled from key directories)</span></div>
+    <p class="sec-desc">World-writable files can be modified by any user or process, making them potential targets for injection attacks or backdoors. Files in <em>/etc</em>, <em>/usr</em>, and web roots should never be world-writable.</p>
+    <div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>File</th></tr></thead><tbody>{ww_h}</tbody></table></div>
   </div>
 </div>
 </details>
 <details>
 <summary>{icon('settings')} Hardening Baseline <span class="badge {'badge-green' if sysctl_fail==0 else 'badge-orange'}">{sysctl_ok}/{sysctl_ok+sysctl_fail} sysctl</span> <span class="caret">&#9658;</span></summary>
-<div class="det-body">
-  <div class="card-grid">
-    <div class="card" style="grid-column:span 2"><div class="card-title">{icon('settings',13)} Security Sysctl {badge(f'{sysctl_ok} hardened','green')} {badge(f'{sysctl_fail} non-compliant','red' if sysctl_fail else 'gray')}</div><div class="tbl-wrap scrollable"><table><thead><tr><th>Parameter</th><th>Value</th><th>Compliance</th><th>Description</th></tr></thead><tbody>{"".join(sysctl_rows_h)}</tbody></table></div></div>
-    <div class="card"><div class="card-title">{icon('lock',13)} SSH Config <span class="muted small">(sshd -T)</span></div><p class="muted small" style="margin-bottom:8px">Security-sensitive rows are highlighted.</p><div class="tbl-wrap" style="max-height:460px"><table><thead><tr><th>Directive</th><th>Value</th></tr></thead><tbody>{"".join(sshd_rows_h)}</tbody></table></div></div>
-    <div class="card"><div class="card-title">{icon('shield',13)} MAC &mdash; {esc(mac_type)}</div><div style="margin-bottom:8px">{mac_b} {esc(mac_status)}</div><pre class="code-block">{esc(mac_detail[:1500])}</pre></div>
-    <div class="card"><div class="card-title">{icon('info',13)} NTP &mdash; {esc(ntp_tool)}</div><div style="margin-bottom:8px">{ntp_b}</div><pre class="code-block">{esc(ntp_detail[:1000])}</pre></div>
-    <div class="card"><div class="card-title">{icon('settings',13)} Audit Rules {badge(str(len(audit)),'green' if audit else 'gray')}</div><div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>Rule</th></tr></thead><tbody>{audit_h}</tbody></table></div></div>
-    <div class="card"><div class="card-title">{icon('package',13)} Pending Updates {badge(str(len(upgrades)),'warn' if upgrades else 'green')}</div><div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>Package</th></tr></thead><tbody>{upg_h}</tbody></table></div></div>
-    <div class="card"><div class="card-title">{icon('database',13)} TLS Certificates</div><div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>File</th><th>Subject</th><th>Expires</th><th>Days</th><th>Status</th></tr></thead><tbody>{"".join(cert_h)}</tbody></table></div></div>
+<div class="det-body" style="display:flex;flex-direction:column;gap:18px">
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('settings',14)} Security Sysctl Parameters {badge(f'{sysctl_ok} hardened','green')} {badge(f'{sysctl_fail} non-compliant','red' if sysctl_fail else 'gray')}</div>
+    <p class="sec-desc">Kernel hardening parameters control how the OS responds to various security-relevant events. Each parameter is compared against the recommended hardening value. Non-compliant values increase the attack surface and should be corrected in <code>/etc/sysctl.conf</code>.</p>
+    <div class="tbl-wrap scrollable"><table><thead><tr><th>Parameter</th><th>Current Value</th><th>Compliance</th><th>Description</th></tr></thead><tbody>{"".join(sysctl_rows_h)}</tbody></table></div>
   </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('lock',14)} SSH Daemon Effective Configuration <span class="muted small">(sshd -T)</span></div>
+    <p class="sec-desc">The effective SSH configuration is extracted live from the SSH daemon using <code>sshd -T</code>. Security-relevant directives are highlighted. Key settings like <em>PermitRootLogin</em>, <em>PasswordAuthentication</em>, and <em>X11Forwarding</em> directly affect the attack surface exposed via SSH.</p>
+    <div class="tbl-wrap" style="max-height:480px"><table><thead><tr><th>Directive</th><th>Value</th></tr></thead><tbody>{"".join(sshd_rows_h)}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('shield',14)} Mandatory Access Control (MAC) &mdash; {esc(mac_type)}</div>
+    <p class="sec-desc">MAC frameworks like AppArmor and SELinux enforce mandatory security policies that restrict what processes can do, even when running as root. They provide an important additional layer of defence against privilege escalation and malware.</p>
+    <div style="margin-bottom:8px">{mac_b} {esc(mac_status)}</div>
+    <pre class="code-block">{esc(mac_detail[:1500])}</pre>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('info',14)} NTP Time Synchronisation &mdash; {esc(ntp_tool)}</div>
+    <p class="sec-desc">Accurate time is critical for log integrity, certificate validation, Kerberos authentication, and forensic analysis. An out-of-sync clock can invalidate certificates, corrupt logs, and break authentication mechanisms.</p>
+    <div style="margin-bottom:8px">{ntp_b}</div>
+    <pre class="code-block">{esc(ntp_detail[:1000])}</pre>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('settings',14)} Audit Rules (auditd) {badge(str(len(audit)),'green' if audit else 'gray')}</div>
+    <p class="sec-desc">The Linux Audit Framework records security-relevant system calls and file access events. Effective audit rules ensure accountability and support forensic investigation. The absence of rules means no security events are logged at the kernel level.</p>
+    <div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>Audit Rule</th></tr></thead><tbody>{audit_h}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('package',14)} Pending Software Updates {badge(str(len(upgrades)),'warn' if upgrades else 'green')}</div>
+    <p class="sec-desc">Unpatched software is one of the leading causes of security breaches. Each pending update may contain fixes for known CVEs. Systems should be updated regularly, and a patch management process should be established.</p>
+    <div class="tbl-wrap" style="max-height:300px"><table><thead><tr><th>Package with pending update</th></tr></thead><tbody>{upg_h}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('database',14)} TLS Certificate Expiry</div>
+    <p class="sec-desc">Expired or soon-to-expire certificates cause service disruptions and erode trust. Certificates expiring within 30 days are flagged as warnings. Automated certificate management (e.g. Let&apos;s Encrypt / certbot) is recommended where applicable.</p>
+    <div class="tbl-wrap" style="max-height:360px"><table><thead><tr><th>File</th><th>Subject</th><th>Expires</th><th>Days left</th><th>Status</th></tr></thead><tbody>{"".join(cert_h)}</tbody></table></div>
+  </div>
+
 </div>
 </details>
 <details>
 <summary>{icon('login')} Login Activity <span class="caret">&#9658;</span></summary>
-<div class="det-body"><div class="card-grid">
-  <div class="card" style="grid-column:span 2"><div class="card-title">{icon('login',13)} Recent Successful Logins</div><div class="tbl-wrap scrollable"><table><thead><tr><th>User</th><th>TTY</th><th>Host / Source</th><th>Date &amp; Duration</th></tr></thead><tbody>{"".join(login_rows_h)}</tbody></table></div></div>
-  <div class="card" style="grid-column:span 2"><div class="card-title">{icon('alert',13)} Failed Login Attempts <span class="muted small">(requires root)</span></div><div class="tbl-wrap scrollable"><table><thead><tr><th>User</th><th>TTY</th><th>Host / Source</th><th>Date</th></tr></thead><tbody>{"".join(failed_rows_h)}</tbody></table></div></div>
-</div></div>
+<div class="det-body" style="display:flex;flex-direction:column;gap:18px">
+  <p class="sec-desc">Login history provides accountability and helps detect unauthorised access. Multiple failed logins from the same source may indicate a brute-force attempt. Successful logins from unexpected sources or at unusual times should be investigated.</p>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('login',14)} Recent Successful Logins (last 50)</div>
+    <div class="tbl-wrap scrollable"><table><thead><tr><th>User</th><th>TTY</th><th>Host / Source</th><th>Date &amp; Duration</th></tr></thead><tbody>{"".join(login_rows_h)}</tbody></table></div>
+  </div>
+
+  <div class="subsection">
+    <div class="subsec-hdr">{icon('alert',14)} Failed Login Attempts (last 50) <span class="muted small">&mdash; requires root for <code>lastb</code></span></div>
+    <div class="tbl-wrap scrollable"><table><thead><tr><th>User</th><th>TTY</th><th>Host / Source</th><th>Date</th></tr></thead><tbody>{"".join(failed_rows_h)}</tbody></table></div>
+  </div>
+</div>
 </details>
 <details>
 <summary>{icon('calendar')} Scheduled Tasks <span class="caret">&#9658;</span></summary>
 <div class="det-body">
+  <p class="sec-desc">Scheduled tasks (cron jobs and systemd timers) run automatically and can be used by attackers to maintain persistence. Any unexpected or unauthorised scheduled task should be removed. Tasks running as root are particularly sensitive and must be reviewed carefully.</p>
   <div class="tbl-wrap scrollable"><table><thead><tr><th style="width:200px">Source</th><th style="width:80px">Type</th><th>Entry / Command</th></tr></thead><tbody>{"".join(cron_rows_h)}</tbody></table></div>
 </div>
 </details>
 <details>
 <summary>{icon('file')} Critical Configuration Files <span class="caret">&#9658;</span></summary>
 <div class="det-body">
+  <p class="sec-desc">Key system configuration files control authentication, access policies, and security behaviour. Their presence, permissions, and content are audited here. Files with incorrect permissions or unexpected content may indicate misconfiguration or tampering. Comments are stripped from the preview for readability.</p>
   <div class="tbl-wrap scrollable"><table><thead><tr><th style="width:180px">Path</th><th style="width:65px">Present</th><th style="width:70px">Mode</th><th style="width:130px">Owner:Group</th><th style="width:80px">Size</th><th>Content Preview</th></tr></thead><tbody>{"".join(imp_file_rows_h)}</tbody></table></div>
 </div>
 </details>
